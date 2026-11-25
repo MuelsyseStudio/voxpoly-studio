@@ -1,0 +1,43 @@
+# Python & Virtual Environments
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+
+# Runtime User Data, Personal Recordings, Model Weights & Local Secrets
+data/
+local_data/
+*.local.json
+.env
+.env.*
+
+# Media & Binary Weights (keep docs/assets/studio-preview.png tracked)
+*.wav
+*.mp3
+*.m4a
+*.webm
+*.ogg
+*.flac
+*.mp4
+*.mov
+*.mkv
+*.zip
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.ckpt
+*.onnx
+
+# OS & Editor Junk
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.log

@@ -1,0 +1,602 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>VoxPoly Studio V2 Pro · 多语种声纹与视频译配工坊</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Noto+Sans+SC:wght@400;500;600;700&family=Plus+Jakarta+Sans:wght@500;600;700;800&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <header class="studio-bar">
+    <div class="studio-bar-inner">
+      <div class="brand-group">
+        <div class="brand-mark" aria-hidden="true">
+          <svg width="26" height="26" viewBox="0 0 26 26" fill="none">
+            <rect x="1" y="1" width="24" height="24" rx="6" stroke="currentColor" stroke-width="1.6"/>
+            <line x1="6.5" y1="10" x2="6.5" y2="16" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+            <line x1="10.5" y1="6.5" x2="10.5" y2="19.5" stroke="#0D6E6E" stroke-width="2" stroke-linecap="round"/>
+            <line x1="14.5" y1="8.5" x2="14.5" y2="17.5" stroke="#D92D20" stroke-width="2" stroke-linecap="round"/>
+            <line x1="18.5" y1="11" x2="18.5" y2="15" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+          </svg>
+        </div>
+        <div class="brand-copy">
+          <div class="brand-name-row">
+            <span class="brand-name">VoxPoly Studio</span>
+            <span class="brand-edition">V2.0 Pro</span>
+          </div>
+          <span class="brand-sub">三引擎声纹克隆 · 长文批加速 · 视频一键多语种译配</span>
+        </div>
+      </div>
+
+      <nav class="workspace-nav" aria-label="工作台模式切换">
+        <button type="button" class="nav-tab active" data-workspace-tab="audio">多语种语音 / 长文</button>
+        <button type="button" class="nav-tab" data-workspace-tab="video">视频一键译配</button>
+        <button type="button" class="nav-tab" data-workspace-tab="watermark">防伪水印查验</button>
+      </nav>
+
+      <div class="status-cluster">
+        <div class="engine-pill" id="enginePill" title="GPU 与当前引擎遥测">
+          <span class="status-dot" id="engineDot"></span>
+          <span class="engine-pill-text" id="engineStatusText">检测 GPU 引擎中…</span>
+          <span class="mono-sep" id="gpuTelemetry"></span>
+        </div>
+        <button type="button" class="btn-ghost" id="btnPreload" hidden>预热引擎</button>
+        <button type="button" class="btn-outline" id="btnUnloadVram" hidden>释放显存</button>
+        <button type="button" class="btn-outline" id="btnOpenSettings" title="翻译、水印与显存设置">设置</button>
+      </div>
+    </div>
+  </header>
+
+  <main class="desk-layout">
+    <!-- LEFT RAIL: SHARED VOICEPRINT DECK -->
+    <aside class="voice-rail">
+      <section class="panel" aria-labelledby="voiceDeckTitle">
+        <div class="panel-header">
+          <div>
+            <span class="step-index">01</span>
+            <h2 class="panel-title" id="voiceDeckTitle">声纹采集与档案台</h2>
+          </div>
+          <div class="segmented" role="tablist">
+            <button type="button" class="seg-btn active" data-capture-tab="upload" role="tab" aria-selected="true">上传录音</button>
+            <button type="button" class="seg-btn" data-capture-tab="record" role="tab" aria-selected="false">麦克风直录</button>
+          </div>
+        </div>
+
+        <div class="capture-pane" id="paneUpload">
+          <div class="dropzone" id="dropzone" tabindex="0" role="button" aria-label="点击或拖拽上传人声参考音频">
+            <input type="file" id="audioFileInput" accept=".wav,.mp3,.m4a,.webm,.ogg,.flac,.aac,.mp4,.opus,audio/*" hidden />
+            <div class="dropzone-icon" aria-hidden="true">
+              <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
+                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+                <polyline points="17 8 12 3 7 8"/>
+                <line x1="12" y1="3" x2="12" y2="15"/>
+              </svg>
+            </div>
+            <div class="dropzone-title">拖入或选择一段本人录音</div>
+            <div class="dropzone-hint">推荐 5–15 秒清晰干声 · WAV / MP3 / M4A / WebM / FLAC</div>
+          </div>
+
+          <div class="upload-opts">
+            <input type="text" id="uploadVoiceName" class="field-input" placeholder="声纹名称（可选，例如：我的中文原声）" maxlength="36" />
+            <label class="check-row">
+              <input type="checkbox" id="uploadAutoAsr" checked />
+              <span id="asrOptionLabel">上传后自动 Whisper 识别参考文本</span>
+            </label>
+            <label class="check-row consent-row">
+              <input type="checkbox" id="chkVoiceConsent" checked />
+              <span>我确认该录音为本人声音或已获明确授权</span>
+            </label>
+          </div>
+          <div class="inline-status" id="uploadStatus" hidden></div>
+        </div>
+
+        <div class="capture-pane" id="paneRecord" hidden>
+          <div class="recorder-stage">
+            <canvas id="micMeterCanvas" class="mic-meter" width="320" height="64"></canvas>
+            <div class="recorder-controls">
+              <button type="button" class="rec-btn" id="btnRecToggle" aria-label="开始或停止录音">
+                <span class="rec-inner"></span>
+              </button>
+              <div class="rec-meta">
+                <div class="rec-timer" id="recTimer">00:00.0</div>
+                <div class="rec-hint" id="recHint">点击红键录制 8–12 秒自然朗读，保持环境安静</div>
+              </div>
+            </div>
+            <div class="rec-prompt-card">
+              <span class="rec-prompt-label">参考朗读例句</span>
+              <p>「今天天气非常舒服，我希望用这段清晰的自然人声，记录下我自己的真实声纹，去尝试用不同语言和世界对话。」</p>
+            </div>
+            <div class="rec-save-row" id="recSaveRow" hidden>
+              <input type="text" id="recVoiceName" class="field-input" placeholder="声纹名称（例如：麦克风录制）" maxlength="36" />
+              <button type="button" class="btn-teal" id="btnSaveRecording">保存到声纹库</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="voice-inspector" id="voiceInspector" hidden>
+          <div class="inspector-top">
+            <div class="inspector-title-wrap">
+              <span class="active-tag">当前激活声纹</span>
+              <h3 class="inspector-name" id="activeVoiceName">—</h3>
+            </div>
+            <span class="quality-badge" id="activeQualityBadge">—</span>
+          </div>
+
+          <div class="telemetry-row" id="activeTelemetryRow"></div>
+
+          <div class="wave-player compact" id="refWavePlayer">
+            <button type="button" class="play-btn" id="btnPlayRef" aria-label="试听参考原声">
+              <svg class="icon-play" width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><polygon points="6 4 20 12 6 20 6 4"/></svg>
+              <svg class="icon-pause" width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></svg>
+            </button>
+            <canvas id="refWaveCanvas" class="wave-canvas" width="120" height="40"></canvas>
+            <span class="timecode" id="refTimecode">00:00</span>
+          </div>
+
+          <div class="warning-list" id="activeVoiceWarnings" hidden></div>
+
+          <div class="ref-text-block">
+            <div class="ref-text-head">
+              <label for="activeRefText">参考录音文本（ICL / CosyVoice 对齐）</label>
+              <div class="ref-text-actions">
+                <button type="button" class="link-btn" id="btnReTranscribe">AI 自动识别</button>
+                <button type="button" class="link-btn" id="btnSaveRefText">保存修改</button>
+              </div>
+            </div>
+            <textarea id="activeRefText" class="field-textarea compact" rows="2" placeholder="用于 ICL 高保真模式与 CosyVoice 3 零样本对齐"></textarea>
+          </div>
+        </div>
+
+        <div class="library-section">
+          <div class="library-head">
+            <span>声纹档案库</span>
+            <span class="count-mono" id="voiceCountBadge">0</span>
+          </div>
+          <div class="voice-list" id="voiceList">
+            <div class="empty-hint">正在读取声纹档案…</div>
+          </div>
+        </div>
+      </section>
+    </aside>
+
+    <!-- RIGHT MAIN CONSOLE -->
+    <div class="main-console">
+      <!-- ==================== WORKSPACE 1: AUDIO & LONG-FORM ==================== -->
+      <div id="workspaceAudio" class="workspace-pane">
+        <section class="panel" aria-labelledby="scriptDeskTitle">
+          <div class="panel-header">
+            <div>
+              <span class="step-index">02</span>
+              <h2 class="panel-title" id="scriptDeskTitle">三引擎选择与多语种 / 长文编排</h2>
+            </div>
+            <div class="preset-row" id="presetBar" aria-label="快捷场景预设"></div>
+          </div>
+
+          <!-- 3-Engine Selector -->
+          <div class="engine-selector-grid cols-3" id="engineSelectorGrid">
+            <button type="button" class="engine-card active" data-select-engine="qwen3">
+              <div class="engine-card-top">
+                <span class="engine-card-name">Qwen3-TTS 1.7B</span>
+                <span class="engine-badge" id="badgeEngineQwen">10 语种 · 批加速</span>
+              </div>
+              <div class="engine-card-desc">中英日韩欧语自然度标杆，支持长文批处理加速与 ICL 高保真对齐</div>
+            </button>
+
+            <button type="button" class="engine-card" data-select-engine="chatterbox">
+              <div class="engine-card-top">
+                <span class="engine-card-name">Chatterbox V3</span>
+                <span class="engine-badge" id="badgeEngineChatterbox">23 语种 · MIT</span>
+              </div>
+              <div class="engine-card-desc">覆盖阿语/印地/土语/北欧/希伯来等 23 语种，支持表现力与口音抑制</div>
+            </button>
+
+            <button type="button" class="engine-card" data-select-engine="cosyvoice3">
+              <div class="engine-card-top">
+                <span class="engine-card-name">CosyVoice 3.0</span>
+                <span class="engine-badge" id="badgeEngineCosy">方言与情绪指令</span>
+              </div>
+              <div class="engine-card-desc">支持粤语/四川/东北/上海等 18+ 方言、耳语/激情与 [laughter] 副语言</div>
+            </button>
+          </div>
+
+          <!-- CosyVoice 3 Dialect & Emotion Instruct Panel -->
+          <div class="instruct-bar" id="cosyInstructBox" hidden>
+            <div class="instruct-head">
+              <span>CosyVoice 3 方言与情绪指令（自动采用官方 <code>&lt;|endofprompt|&gt;</code> 格式）</span>
+              <span class="count-mono">支持在正文中插入 [laughter] / [breath]</span>
+            </div>
+            <div class="instruct-presets" id="cosyInstructPresets"></div>
+            <input type="text" id="cosyInstructInput" class="field-input" placeholder="自定义自然语言指令（留空则按参考原声自然朗读，例如：请用四川话带点幽默感说。）" />
+          </div>
+
+          <div class="source-block">
+            <div class="field-head">
+              <label for="sourceScript">输入台词或长篇文章（最高 8,000 字，长文自动按段落/句界智能切分并平滑拼接）</label>
+              <span class="char-counter" id="sourceCharCount">0 字 · 1 段</span>
+            </div>
+            <textarea
+              id="sourceScript"
+              class="field-textarea source-textarea"
+              rows="4"
+              placeholder="输入一句问候，或直接粘贴 500–3000 字播客稿/有声书段落，系统会自动分句、并行合成并平滑拼接。"
+            ></textarea>
+          </div>
+
+          <div class="lang-section">
+            <div class="lang-head">
+              <span class="section-label" id="langSectionLabel">目标语种（Qwen3-TTS 原生支持 10 国语言）</span>
+              <div class="lang-quick-actions">
+                <button type="button" class="link-btn" id="btnSelectTop4">常用 4 语种</button>
+                <button type="button" class="link-btn" id="btnSelectCore10">主流语种</button>
+                <button type="button" class="link-btn" id="btnSelectAll23" hidden>全选 23 语种</button>
+              </div>
+            </div>
+            <div class="lang-grid" id="langGrid"></div>
+          </div>
+
+          <div class="transport-bar">
+            <div class="transport-left">
+              <button type="button" class="btn-outline" id="btnTranslate">
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 8l6 6"/><path d="M4 14l6-6 2-3"/><path d="M2 5h12"/><path d="M7 2h1"/><path d="M22 22l-5-10-5 10"/><path d="M14 18h6"/></svg>
+                <span>一键翻译所选语种</span>
+              </button>
+
+              <div class="mode-switch" id="qwenModeBox">
+                <button type="button" class="mode-opt active" data-mode="icl">ICL 高保真</button>
+                <button type="button" class="mode-opt" data-mode="xvector">纯声纹跨语种</button>
+              </div>
+
+              <div class="chatterbox-params" id="chatterboxParamBox" hidden>
+                <label class="param-slider" title="情绪与韵律夸张度，默认 0.5">
+                  <span>表现力 <strong id="valExag">0.50</strong></span>
+                  <input type="range" id="rngExag" min="0.1" max="1.2" step="0.05" value="0.5" />
+                </label>
+                <label class="param-slider" title="跨语种调低至 0.0–0.3 可消除原声母语口音">
+                  <span>CFG <strong id="valCfg">0.35</strong></span>
+                  <input type="range" id="rngCfg" min="0.0" max="0.8" step="0.05" value="0.35" />
+                </label>
+              </div>
+
+              <label class="check-row inline" title="长文合成时，首段生成完毕立即自动开始试听，无需等待整篇结束">
+                <input type="checkbox" id="chkStreamPreview" checked />
+                <span>边生成边试听</span>
+              </label>
+
+              <label class="check-row inline">
+                <input type="checkbox" id="chkAutoReel" checked />
+                <span>自动串烧</span>
+              </label>
+            </div>
+
+            <button type="button" class="btn-primary-rec" id="btnGenerate">
+              <span class="rec-dot-mini"></span>
+              <span id="btnGenerateLabel">一键生成多国语音</span>
+            </button>
+          </div>
+
+          <div class="inline-status" id="translateStatus" hidden></div>
+
+          <div class="scripts-drawer">
+            <div class="scripts-drawer-head">
+              <span>各语种待合成台词（可直接微调标点与措辞）</span>
+              <button type="button" class="link-btn" id="btnToggleScripts">收起编辑区</button>
+            </div>
+            <div class="per-lang-grid" id="perLangScripts"></div>
+          </div>
+        </section>
+
+        <!-- 03 MASTER TRACKS -->
+        <section class="panel" aria-labelledby="tracksTitle">
+          <div class="panel-header">
+            <div>
+              <span class="step-index">03</span>
+              <h2 class="panel-title" id="tracksTitle">多语种母带输出台</h2>
+            </div>
+            <div class="output-actions" id="jobHeaderActions" hidden>
+              <button type="button" class="btn-outline btn-sm" id="btnBuildReel">重新合成串烧</button>
+              <a class="btn-teal btn-sm" id="btnDownloadZip" href="#" download>打包下载全部 ZIP</a>
+            </div>
+          </div>
+
+          <div id="jobMetaStrip" class="job-meta-strip" hidden>
+            <div class="job-meta-left">
+              <span class="job-status-badge" id="jobStatusBadge">—</span>
+              <span class="job-meta-desc" id="jobMetaDesc">—</span>
+            </div>
+            <div class="progress-wrap" id="jobProgressWrap" hidden>
+              <div class="progress-bar"><div class="progress-fill" id="jobProgressFill"></div></div>
+              <span class="count-mono" id="jobProgressLabel">0 / 0</span>
+            </div>
+          </div>
+
+          <div class="reel-card" id="reelCard" hidden>
+            <div class="reel-head">
+              <div class="reel-title-group">
+                <span class="reel-tag">MASTER REEL</span>
+                <h3>多语种无缝串烧试听</h3>
+                <span class="reel-langs" id="reelLangSummary"></span>
+              </div>
+              <div class="reel-actions">
+                <span class="mono-metric" id="reelDurationMetric"></span>
+                <a class="btn-outline btn-sm" id="btnDownloadReel" href="#" download>下载串烧 MP3</a>
+              </div>
+            </div>
+            <div class="wave-player reel-player" id="reelWavePlayer">
+              <button type="button" class="play-btn teal" id="btnPlayReel" aria-label="播放多语种串烧">
+                <svg class="icon-play" width="15" height="15" viewBox="0 0 24 24" fill="currentColor"><polygon points="6 4 20 12 6 20 6 4"/></svg>
+                <svg class="icon-pause" width="15" height="15" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></svg>
+              </button>
+              <canvas id="reelWaveCanvas" class="wave-canvas" width="120" height="48"></canvas>
+              <span class="timecode" id="reelTimecode">00:00 / 00:00</span>
+            </div>
+          </div>
+
+          <div class="tracks-list" id="tracksList">
+            <div class="empty-stage">
+              <div class="empty-stage-title">尚未开始生成多语种音轨</div>
+              <p>选择左侧声纹与上方引擎（Qwen3 / Chatterbox / CosyVoice 3），输入短句或千字长文，一键生成。</p>
+            </div>
+          </div>
+        </section>
+
+        <!-- 04 HISTORY -->
+        <section class="panel" aria-labelledby="historyTitle">
+          <div class="panel-header">
+            <div>
+              <span class="step-index">04</span>
+              <h2 class="panel-title" id="historyTitle">历史生成批次</h2>
+            </div>
+            <span class="count-mono" id="historyCount">0 条记录</span>
+          </div>
+          <div class="history-list" id="historyList">
+            <div class="empty-hint">暂无历史批次</div>
+          </div>
+        </section>
+      </div>
+
+      <!-- ==================== WORKSPACE 2: VIDEO DUBBING STUDIO ==================== -->
+      <div id="workspaceVideo" class="workspace-pane" hidden>
+        <section class="panel" aria-labelledby="videoDubTitle">
+          <div class="panel-header">
+            <div>
+              <span class="step-index">V1</span>
+              <h2 class="panel-title" id="videoDubTitle">视频一键多语种译配（保留原声 BGM + 时长对齐 + 双语字幕）</h2>
+            </div>
+            <span class="quality-badge" id="demucsStatusBadge">检测人声分离引擎…</span>
+          </div>
+
+          <div class="dropzone video-dropzone" id="videoDropzone" tabindex="0" role="button">
+            <input type="file" id="videoFileInput" accept=".mp4,.mov,.mkv,.webm,.avi,.m4v,video/*" hidden />
+            <div class="dropzone-icon" aria-hidden="true">
+              <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
+                <polygon points="23 7 16 12 23 17 23 7"/>
+                <rect x="1" y="5" width="15" height="14" rx="2" ry="2"/>
+              </svg>
+            </div>
+            <div class="dropzone-title">拖入或选择一段口播 / 宣传短视频（MP4 / MOV / WebM，上限 300 MB）</div>
+            <div class="dropzone-hint">自动分离原声与 BGM → Whisper 提取时间轴台词 → 自动提取说话人原声纹 → 一键生成多国配音成片</div>
+          </div>
+          <div class="inline-status" id="videoUploadStatus" hidden></div>
+
+          <!-- Active Video Workspace -->
+          <div id="videoProjectStage" hidden>
+            <div class="video-overview-grid">
+              <div class="video-preview-box">
+                <div class="video-box-head">
+                  <strong id="videoTitle">—</strong>
+                  <span class="count-mono" id="videoMetaStats">—</span>
+                </div>
+                <video id="sourceVideoPlayer" class="video-el" controls playsinline></video>
+              </div>
+
+              <div class="video-config-box">
+                <div class="form-group">
+                  <label for="vidVoiceSelect">配音使用声纹</label>
+                  <select id="vidVoiceSelect" class="field-input">
+                    <option value="auto_video">自动克隆视频原说话人声纹（推荐）</option>
+                  </select>
+                </div>
+
+                <div class="form-row-2">
+                  <div class="form-group">
+                    <label for="vidEngineSelect">译配语音引擎</label>
+                    <select id="vidEngineSelect" class="field-input">
+                      <option value="qwen3">Qwen3-TTS 1.7B（10 语种）</option>
+                      <option value="chatterbox">Chatterbox V3（23 语种）</option>
+                      <option value="cosyvoice3">CosyVoice 3.0（方言/情绪）</option>
+                    </select>
+                  </div>
+                  <div class="form-group">
+                    <label for="vidBgmSlider">原背景音 BGM 音量 <strong id="valBgmVol">85%</strong></label>
+                    <input type="range" id="vidBgmSlider" min="0" max="1.2" step="0.05" value="0.85" />
+                  </div>
+                </div>
+
+                <div class="form-group">
+                  <label>选择目标译配语种</label>
+                  <div class="vid-lang-chips" id="vidLangChips"></div>
+                </div>
+
+                <label class="check-row">
+                  <input type="checkbox" id="chkBurnSubtitles" />
+                  <span>将双语字幕直接硬压进 MP4 画面（勾选后重新编码画面，默认无损秒级合成 + 外挂 SRT）</span>
+                </label>
+
+                <div class="vid-action-row">
+                  <button type="button" class="btn-outline" id="btnVideoTranslate">① 一键等时长翻译字幕</button>
+                  <button type="button" class="btn-primary-rec" id="btnVideoDub">
+                    <span class="rec-dot-mini"></span>
+                    <span>② 一键生成多语种译配视频</span>
+                  </button>
+                </div>
+                <div class="inline-status" id="videoDubStatus" hidden></div>
+              </div>
+            </div>
+
+            <!-- Timeline Segments Editor -->
+            <div class="segments-panel">
+              <div class="scripts-drawer-head">
+                <span>视频时间轴台词与译文校对（可逐句微调，超长译文将自动无变调变速对齐）</span>
+                <select id="vidPreviewLangSelect" class="field-input inline-select"></select>
+              </div>
+              <div class="segments-table" id="vidSegmentsList"></div>
+            </div>
+
+            <!-- Dubbed Video Outputs -->
+            <div class="video-outputs-panel" id="vidOutputsPanel" hidden>
+              <div class="panel-header">
+                <div>
+                  <span class="step-index">V2</span>
+                  <h3 class="panel-title">多语种成片与字幕导出</h3>
+                </div>
+                <a class="btn-teal btn-sm" id="btnVideoDownloadZip" href="#" download>打包下载全部视频 + SRT</a>
+              </div>
+              <div class="video-outputs-grid" id="vidOutputsGrid"></div>
+            </div>
+          </div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-header">
+            <div>
+              <span class="step-index">V3</span>
+              <h2 class="panel-title">历史视频译配记录</h2>
+            </div>
+            <span class="count-mono" id="videoHistoryCount">0 条记录</span>
+          </div>
+          <div class="history-list" id="videoHistoryList">
+            <div class="empty-hint">暂无视频译配记录</div>
+          </div>
+        </section>
+      </div>
+
+      <!-- ==================== WORKSPACE 3: WATERMARK VERIFY LAB ==================== -->
+      <div id="workspaceWatermark" class="workspace-pane" hidden>
+        <section class="panel" aria-labelledby="wmLabTitle">
+          <div class="panel-header">
+            <div>
+              <span class="step-index">W1</span>
+              <h2 class="panel-title" id="wmLabTitle">AI 隐形声纹防伪水印查验台</h2>
+            </div>
+            <span class="quality-badge">7.2–9.6 kHz 不可听扩频水印 · 抗 MP3 压缩</span>
+          </div>
+
+          <p class="wm-intro">
+            VoxPoly Studio V2 默认在每条合成音频中嵌入人耳不可察觉的扩频防伪水印（可在「设置」中开关），用于履行 AI 语音溯源合规义务。在此上传任意 <code>WAV / MP3 / M4A / MP4</code> 文件即可查验是否由本工坊生成。
+          </p>
+
+          <div class="dropzone" id="wmDropzone" tabindex="0" role="button">
+            <input type="file" id="wmFileInput" accept="audio/*,video/*" hidden />
+            <div class="dropzone-title">拖入或选择待检测音频 / 视频文件</div>
+            <div class="dropzone-hint">支持本工坊导出的 WAV、192k MP3 或译配 MP4 成片</div>
+          </div>
+
+          <div id="wmResultCard" class="wm-result-card" hidden>
+            <div class="wm-result-top">
+              <span class="wm-verdict-badge" id="wmVerdictBadge">—</span>
+              <span class="mono-metric" id="wmFileMeta">—</span>
+            </div>
+            <p class="wm-verdict-text" id="wmVerdictText">—</p>
+            <div class="telemetry-row" id="wmMetricsRow"></div>
+          </div>
+        </section>
+      </div>
+    </div>
+  </main>
+
+  <footer class="studio-footer">
+    <div class="studio-footer-inner">
+      <span>VoxPoly Studio V2 Pro · Qwen3-TTS (Apache-2.0) + Chatterbox V3 (MIT) + CosyVoice 3 (Apache-2.0)</span>
+      <span>安全合规：请仅克隆本人或经授权声纹，默认启用隐形防伪水印</span>
+    </div>
+  </footer>
+
+  <!-- SETTINGS MODAL -->
+  <div class="modal-backdrop" id="settingsModal" hidden>
+    <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="settingsModalTitle">
+      <div class="modal-head">
+        <h3 id="settingsModalTitle">翻译、加速与合规设置</h3>
+        <button type="button" class="icon-close" id="btnCloseSettings" aria-label="关闭设置">✕</button>
+      </div>
+      <div class="modal-body">
+        <div class="form-group">
+          <label for="setProvider">多语种台词 / 视频等时长译配引擎</label>
+          <select id="setProvider" class="field-input">
+            <option value="auto">智能优先（已填 API Key 则走大模型，否则免费翻译）</option>
+            <option value="free">仅使用免配置免费翻译（Google / MyMemory）</option>
+            <option value="llm">强制使用自定义 OpenAI 兼容大模型（口语译配 & 视频等长字幕更准）</option>
+          </select>
+        </div>
+
+        <div class="form-group">
+          <label for="setApiBase">大模型 API Base URL（支持 DeepSeek / OpenAI / 硅基流动）</label>
+          <input type="url" id="setApiBase" class="field-input" placeholder="https://api.deepseek.com/v1" />
+        </div>
+
+        <div class="form-row-2">
+          <div class="form-group">
+            <label for="setModel">模型名称</label>
+            <input type="text" id="setModel" class="field-input" placeholder="deepseek-chat" />
+          </div>
+          <div class="form-group">
+            <label for="setApiKey">API Key</label>
+            <input type="password" id="setApiKey" class="field-input" placeholder="sk-..." autocomplete="off" />
+          </div>
+        </div>
+
+        <div class="form-row-2">
+          <div class="form-group">
+            <label for="setQwenVariant">Qwen3-TTS 模型规格</label>
+            <select id="setQwenVariant" class="field-input">
+              <option value="1.7b">1.7B 旗舰版（推荐 ≥8 GB 显存）</option>
+              <option value="0.6b">0.6B 轻量版（4–6 GB 显存 / Mac / CPU）</option>
+            </select>
+          </div>
+          <div class="form-group">
+            <label for="setIdleMinutes">空闲自动释放显存（分钟，0 = 关闭）</label>
+            <input type="number" id="setIdleMinutes" class="field-input" min="0" max="120" value="0" />
+          </div>
+        </div>
+
+        <div class="form-row-2">
+          <label class="check-row">
+            <input type="checkbox" id="setEnableBatch" checked />
+            <span>启用 Qwen3 长文批处理加速</span>
+          </label>
+          <label class="check-row">
+            <input type="checkbox" id="setEnableWatermark" checked />
+            <span>嵌入不可听 AI 防伪水印</span>
+          </label>
+        </div>
+      </div>
+      <div class="modal-foot">
+        <button type="button" class="btn-outline" id="btnCancelSettings">取消</button>
+        <button type="button" class="btn-teal" id="btnSaveSettings">保存设置</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- OPTIONAL ACCESS TOKEN MODAL -->
+  <div class="modal-backdrop" id="tokenModal" hidden>
+    <div class="modal-card" role="dialog" aria-modal="true">
+      <div class="modal-head">
+        <h3>请输入工作台访问口令</h3>
+      </div>
+      <div class="modal-body">
+        <p class="wm-intro">当前云端实例已开启防滥用口令保护（<code>VOXPOLY_ACCESS_TOKEN</code>），输入正确口令后即可正常使用。</p>
+        <input type="password" id="accessTokenInput" class="field-input" placeholder="输入访问口令" />
+      </div>
+      <div class="modal-foot">
+        <button type="button" class="btn-teal" id="btnSubmitToken">确认进入</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="toast-stack" id="toastStack" aria-live="polite"></div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
