@@ -8,18 +8,19 @@ import urllib.request
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import soundfile as sf
 from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from backend.asr_service import asr_service
 from backend.audio_utils import (
+    _run_ffmpeg,
     analyze_audio,
     load_wav_float32,
     merge_multilingual_reel,
@@ -36,6 +37,7 @@ from backend.config import (
     MAX_UPLOAD_MB,
     MAX_VIDEO_MB,
     OUTPUTS_DIR,
+    PODCASTS_DIR,
     PRESET_SCENARIOS,
     QWEN_BATCH_SIZE,
     QWEN_SAMPLE_RATE,
@@ -43,19 +45,33 @@ from backend.config import (
     VIDEOS_DIR,
     VOICES_DIR,
 )
+from backend.document_parser import parse_document_bytes, parse_url_article
+from backend.glossary import apply_tts_pronunciation, glossary_store
+from backend.mastering import MASTERING_PRESETS, apply_mastering_dsp
+from backend.podcast_engine import (
+    assemble_podcast_audio,
+    generate_two_host_podcast_script,
+    parse_dialogue_script,
+    translate_dialogue_turns,
+)
 from backend.store import store, utc_now_iso
 from backend.text_chunker import split_text_for_tts, stitch_chunk_audios
-from backend.translator import translate_scripts, translate_segments_for_dubbing
+from backend.translator import detect_script_language, translate_scripts, translate_segments_for_dubbing
 from backend.tts_engine import engine_manager
 from backend.video_dubbing import (
-    extract_best_voice_reference,
+    SUBTITLE_STYLES,
+    diarize_video_segments,
+    download_video_from_url,
     extract_video_audio,
     fit_segment_tempo,
     has_demucs,
+    has_lipsync,
+    has_yt_dlp,
     mix_and_mux_dubbed_video,
     probe_video,
     separate_vocals_and_bgm,
     write_srt,
+    write_styled_ass,
 )
 from backend.watermark import detect_watermark, embed_watermark
 
@@ -93,6 +109,21 @@ def _decorate_job(job: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
+def _decorate_podcast(pod: Dict[str, Any]) -> Dict[str, Any]:
+    out = dict(pod)
+    tracks = []
+    for t in pod.get("tracks", []):
+        td = dict(t)
+        code = td["lang_code"]
+        if td.get("status") == "completed":
+            td["mp3_url"] = f"/media/podcasts/{pod['id']}/podcast_{code}.mp3"
+            td["wav_url"] = f"/media/podcasts/{pod['id']}/podcast_{code}.wav"
+        tracks.append(td)
+    out["tracks"] = tracks
+    out["zip_url"] = f"/api/podcasts/{pod['id']}/zip"
+    return out
+
+
 def _decorate_video(video: Dict[str, Any]) -> Dict[str, Any]:
     out = dict(video)
     vid = video["id"]
@@ -109,6 +140,7 @@ def _decorate_video(video: Dict[str, Any]) -> Dict[str, Any]:
             od["mp3_url"] = f"/media/videos/{vid}/dub_{code}.mp3"
             od["srt_url"] = f"/media/videos/{vid}/sub_{code}.srt"
             od["bilingual_srt_url"] = f"/media/videos/{vid}/sub_{code}_bilingual.srt"
+            od["ass_url"] = f"/media/videos/{vid}/sub_{code}.ass"
         outputs.append(od)
     out["outputs"] = outputs
     out["zip_url"] = f"/api/videos/{vid}/zip"
@@ -167,27 +199,24 @@ async def lifespan(app: FastAPI):
     saved_variant = str(store.get_settings(masked=False).get("qwen_variant") or "1.7b")
     engine_manager.qwen3.set_variant(saved_variant)
     stop_ev = threading.Event()
-    wd = threading.Thread(target=_idle_watchdog_loop, args=(stop_ev,), daemon=True)
-    wd.start()
+    threading.Thread(target=_idle_watchdog_loop, args=(stop_ev,), daemon=True).start()
     yield
     stop_ev.set()
 
 
-app = FastAPI(title="VoxPoly Studio V2 Pro", version="2.0.0", lifespan=lifespan)
+app = FastAPI(title="VoxPoly Studio V3 Pro", version="3.0.0", lifespan=lifespan)
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 
 @app.middleware("http")
 async def optional_access_token_guard(request: Request, call_next):
-    if ACCESS_TOKEN and request.url.path.startswith("/api/") and request.url.path != "/api/health":
+    if ACCESS_TOKEN and (request.url.path.startswith("/api/") or request.url.path.startswith("/v1/")) and request.url.path != "/api/health":
+        auth_h = request.headers.get("authorization", "")
+        bearer = auth_h[7:].strip() if auth_h.lower().startswith("bearer ") else ""
         supplied = (
             request.headers.get("x-access-token")
+            or bearer
             or request.query_params.get("token")
             or request.cookies.get("voxpoly_token")
             or ""
@@ -200,11 +229,12 @@ async def optional_access_token_guard(request: Request, call_next):
 FRONTEND_DIR.mkdir(parents=True, exist_ok=True)
 app.mount("/media/voices", StaticFiles(directory=str(VOICES_DIR)), name="media_voices")
 app.mount("/media/outputs", StaticFiles(directory=str(OUTPUTS_DIR)), name="media_outputs")
+app.mount("/media/podcasts", StaticFiles(directory=str(PODCASTS_DIR)), name="media_podcasts")
 app.mount("/media/videos", StaticFiles(directory=str(VIDEOS_DIR)), name="media_videos")
 app.mount("/static", StaticFiles(directory=str(FRONTEND_DIR)), name="static_frontend")
 
 
-# ---------- Models ----------
+# ---------- Schemas ----------
 class SettingsPatch(BaseModel):
     translation_provider: Optional[str] = None
     llm_api_base: Optional[str] = None
@@ -212,6 +242,7 @@ class SettingsPatch(BaseModel):
     llm_model: Optional[str] = None
     clear_api_key: Optional[bool] = False
     qwen_variant: Optional[str] = Field(default=None, pattern=r"^(1\.7b|0\.6b)$")
+    mastering_preset: Optional[str] = Field(default=None, pattern="^(raw|podcast|shorts|audiobook)$")
     enable_watermark: Optional[bool] = None
     enable_batch_accel: Optional[bool] = None
     idle_unload_minutes: Optional[int] = Field(default=None, ge=0, le=120)
@@ -226,8 +257,17 @@ class VoicePatch(BaseModel):
     ref_text: Optional[str] = None
 
 
+class GlossaryUpsert(BaseModel):
+    id: Optional[str] = None
+    term: str = Field(..., min_length=1, max_length=120)
+    keep_original: bool = True
+    lang_overrides: Dict[str, str] = Field(default_factory=dict)
+    tts_pronunciation: Dict[str, str] = Field(default_factory=dict)
+    notes: str = ""
+
+
 class TranslateRequest(BaseModel):
-    source_text: str = Field(..., min_length=1, max_length=8000)
+    source_text: str = Field(..., min_length=1, max_length=12000)
     target_langs: List[str] = Field(..., min_length=1)
     source_lang: Optional[str] = None
 
@@ -240,6 +280,7 @@ class GenerateJobRequest(BaseModel):
     exaggeration: float = Field(default=0.5, ge=0.0, le=1.5)
     cfg_weight: float = Field(default=0.35, ge=0.0, le=1.0)
     instruct: str = Field(default="", max_length=300)
+    mastering_preset: Optional[str] = Field(default=None, pattern="^(raw|podcast|shorts|audiobook)$")
     source_text: Optional[str] = ""
     preset_id: Optional[str] = None
     auto_reel: bool = True
@@ -251,11 +292,39 @@ class RegenerateTrackRequest(BaseModel):
     exaggeration: Optional[float] = Field(default=None, ge=0.0, le=1.5)
     cfg_weight: Optional[float] = Field(default=None, ge=0.0, le=1.0)
     instruct: Optional[str] = None
+    mastering_preset: Optional[str] = Field(default=None, pattern="^(raw|podcast|shorts|audiobook)$")
 
 
 class ReelRequest(BaseModel):
     lang_codes: Optional[List[str]] = None
     gap_sec: float = Field(default=0.55, ge=0.1, le=2.0)
+
+
+class DocumentUrlRequest(BaseModel):
+    url: str = Field(..., min_length=6)
+
+
+class PodcastScriptRequest(BaseModel):
+    source_text: str = Field(..., min_length=20, max_length=30000)
+    host_a: str = "主持人"
+    host_b: str = "嘉宾"
+    target_lang: str = "zh"
+    style: str = "deep_dive"
+
+
+class PodcastGenerateRequest(BaseModel):
+    title: str = "AI 多角色播客"
+    script_text: str = Field(..., min_length=4, max_length=20000)
+    speaker_voices: Dict[str, str]
+    target_langs: List[str] = Field(default_factory=lambda: ["zh"], min_length=1)
+    engine_id: str = Field(default="qwen3", pattern="^(qwen3|chatterbox|cosyvoice3)$")
+    mode: str = Field(default="icl", pattern="^(icl|xvector)$")
+    mastering_preset: str = Field(default="podcast", pattern="^(raw|podcast|shorts|audiobook)$")
+    add_ambient_bgm: bool = True
+
+
+class VideoUrlImportRequest(BaseModel):
+    url: str = Field(..., min_length=6)
 
 
 class VideoTranslateRequest(BaseModel):
@@ -267,16 +336,30 @@ class VideoDubRequest(BaseModel):
     target_langs: List[str] = Field(..., min_length=1)
     translations: Dict[str, List[str]]
     engine_id: str = Field(default="qwen3", pattern="^(qwen3|chatterbox|cosyvoice3)$")
-    voice_id: str = Field(default="auto_video")  # "auto_video" clones speaker from video itself!
+    voice_id: str = Field(default="auto_video")
+    speaker_voices: Dict[str, str] = Field(default_factory=dict)  # e.g. {"SPEAKER_1": "auto_video", "SPEAKER_2": "v_xxx"}
     mode: str = Field(default="icl", pattern="^(icl|xvector)$")
     exaggeration: float = Field(default=0.5, ge=0.0, le=1.5)
     cfg_weight: float = Field(default=0.35, ge=0.0, le=1.0)
     instruct: str = Field(default="", max_length=300)
+    mastering_preset: str = Field(default="shorts", pattern="^(raw|podcast|shorts|audiobook)$")
     burn_subtitles: bool = False
+    subtitle_style: str = Field(default="cinema", pattern="^(cinema|shorts_yellow|minimal_bar)$")
+    enable_lipsync: bool = False
     bgm_volume: float = Field(default=0.85, ge=0.0, le=1.2)
 
 
-# ---------- Core Synthesis Helper (Long-form chunking + Qwen3 batching + chunk streaming + watermark) ----------
+class OpenAISpeechRequest(BaseModel):
+    model: str = "voxpoly-qwen3-1.7b"
+    input: str = Field(..., min_length=1, max_length=8000)
+    voice: str = "alloy"
+    response_format: str = Field(default="mp3", pattern="^(mp3|wav|flac|opus)$")
+    speed: float = Field(default=1.0, ge=0.5, le=2.0)
+    language: Optional[str] = None
+    mastering_preset: Optional[str] = None
+
+
+# ---------- Core Synthesis Pipeline (Glossary + Long-Form Batch + Mastering DSP + Watermark) ----------
 def _synthesize_text_smart(
     eng: Any,
     engine_id: str,
@@ -286,16 +369,18 @@ def _synthesize_text_smart(
     mode: str,
     text: str,
     lang_meta: Dict[str, Any],
-    exaggeration: float,
-    cfg_weight: float,
-    instruct: str,
+    exaggeration: float = 0.5,
+    cfg_weight: float = 0.35,
+    instruct: str = "",
     chunk_dir: Optional[Path] = None,
     on_chunk_ready: Optional[Any] = None,
     enable_batch: bool = True,
+    mastering_preset: str = "raw",
     apply_watermark: bool = True,
 ) -> Tuple[np.ndarray, int, float, float, int]:
     lang_code = str(lang_meta["code"])
-    chunks = split_text_for_tts(text, lang_code)
+    spoken_text = apply_tts_pronunciation(text, lang_code)
+    chunks = split_text_for_tts(spoken_text, lang_code)
     if not chunks:
         raise ValueError(f"{lang_meta['label_zh']} 合成文本不能为空。")
 
@@ -363,6 +448,10 @@ def _synthesize_text_smart(
             chunk_audios.append((w, sr, float(c["pause_after_sec"])))
         final_wav = stitch_chunk_audios(chunk_audios, target_sr=sr)
 
+    # Apply broadcast mastering DSP BEFORE embedding watermark so EQ/compression never attenuates watermark
+    if mastering_preset and mastering_preset != "raw":
+        final_wav = apply_mastering_dsp(final_wav, sr, mastering_preset)
+
     if apply_watermark:
         final_wav = embed_watermark(final_wav, sample_rate=sr)
 
@@ -373,7 +462,7 @@ def _synthesize_text_smart(
     return final_wav, sr, elapsed, rtf, len(chunks)
 
 
-# ---------- Audio Generation Background Worker ----------
+# ---------- Background Workers ----------
 def _run_generation_job(job_id: str) -> None:
     job = store.get_job(job_id)
     if not job:
@@ -382,29 +471,27 @@ def _run_generation_job(job_id: str) -> None:
     if not voice:
         job["status"] = "failed"
         job["error"] = "所选声纹不存在或已被删除。"
-        job["updated_at"] = utc_now_iso()
         store.save_job(job)
         return
 
     settings = store.get_settings(masked=False)
     apply_wm = bool(settings.get("enable_watermark", True))
     enable_batch = bool(settings.get("enable_batch_accel", True))
+    mastering_preset = str(job.get("mastering_preset") or settings.get("mastering_preset") or "raw")
     job["watermarked"] = apply_wm
+    job["mastering_preset"] = mastering_preset
 
     engine_id = job.get("engine_id", "qwen3")
     ref_wav_path = VOICES_DIR / voice["id"] / "clone_ref.wav"
     ref_text = str(voice.get("ref_text") or "")
     mode = job.get("mode", "icl")
     effective_mode = (
-        engine_id
-        if engine_id in ("chatterbox", "cosyvoice3")
-        else ("xvector" if (mode == "xvector" or not ref_text.strip()) else "icl")
+        engine_id if engine_id in ("chatterbox", "cosyvoice3") else ("xvector" if (mode == "xvector" or not ref_text.strip()) else "icl")
     )
     job["effective_mode"] = effective_mode
 
     if engine_manager.get_engine(engine_id).get_status()["state"] != "ready":
         job["status"] = "loading_model"
-        job["updated_at"] = utc_now_iso()
         store.save_job(job)
 
     try:
@@ -412,19 +499,17 @@ def _run_generation_job(job_id: str) -> None:
     except Exception as exc:
         job["status"] = "failed"
         job["error"] = f"语音引擎加载失败: {exc}"
-        job["updated_at"] = utc_now_iso()
         store.save_job(job)
         return
 
     job["status"] = "running"
-    job["updated_at"] = utc_now_iso()
     store.save_job(job)
 
     job_dir = OUTPUTS_DIR / job_id
     job_dir.mkdir(parents=True, exist_ok=True)
-
     succeeded = 0
     failed = 0
+
     for track in job["tracks"]:
         lang_code = track["lang_code"]
         lang_meta = LANGUAGE_BY_CODE[lang_code]
@@ -433,7 +518,6 @@ def _run_generation_job(job_id: str) -> None:
         track["ready_chunks"] = []
         track["total_chunks"] = len(split_text_for_tts(track["text"], lang_code))
         job["current_lang"] = lang_code
-        job["updated_at"] = utc_now_iso()
         store.save_job(job)
 
         def _on_chunk(c_idx: int, total_c: int, _track=track) -> None:
@@ -459,6 +543,7 @@ def _run_generation_job(job_id: str) -> None:
                 chunk_dir=job_dir / "chunks" / lang_code,
                 on_chunk_ready=_on_chunk,
                 enable_batch=enable_batch,
+                mastering_preset=mastering_preset,
                 apply_watermark=apply_wm,
             )
             metrics = save_generated_audio(wav_np, sr, job_dir / f"{lang_code}.wav", job_dir / f"{lang_code}.mp3")
@@ -468,6 +553,7 @@ def _run_generation_job(job_id: str) -> None:
                     "elapsed_sec": elapsed,
                     "rtf": rtf,
                     "total_chunks": n_chunks,
+                    "mastering_preset": mastering_preset,
                     "watermarked": apply_wm,
                     **metrics,
                 }
@@ -486,43 +572,20 @@ def _run_generation_job(job_id: str) -> None:
     job["current_lang"] = None
     if succeeded >= 2 and job.get("auto_reel", True):
         try:
-            wav_paths = [
-                job_dir / f"{t['lang_code']}.wav"
-                for t in job["tracks"]
-                if t.get("status") == "completed" and (job_dir / f"{t['lang_code']}.wav").exists()
-            ]
+            wav_paths = [job_dir / f"{t['lang_code']}.wav" for t in job["tracks"] if t.get("status") == "completed" and (job_dir / f"{t['lang_code']}.wav").exists()]
             if len(wav_paths) >= 2:
                 reel_metrics = merge_multilingual_reel(wav_paths, job_dir / "multilingual_reel.mp3")
-                job["reel"] = {
-                    "lang_codes": [t["lang_code"] for t in job["tracks"] if t.get("status") == "completed"],
-                    "created_at": utc_now_iso(),
-                    **reel_metrics,
-                }
+                job["reel"] = {"lang_codes": [t["lang_code"] for t in job["tracks"] if t.get("status") == "completed"], "created_at": utc_now_iso(), **reel_metrics}
         except Exception as exc:
             job["reel_error"] = str(exc)
 
-    if succeeded == len(job["tracks"]):
-        job["status"] = "completed"
-    elif succeeded > 0:
-        job["status"] = "partial"
-    else:
-        job["status"] = "failed"
-        job["error"] = "所有语种均生成失败，请检查引擎状态与文本内容。"
-
+    job["status"] = "completed" if succeeded == len(job["tracks"]) else ("partial" if succeeded > 0 else "failed")
     job["finished_at"] = utc_now_iso()
     job["updated_at"] = utc_now_iso()
     store.save_job(job)
 
 
-def _run_single_track_regen(
-    job_id: str,
-    lang_code: str,
-    new_text: str,
-    mode: str,
-    exaggeration: float,
-    cfg_weight: float,
-    instruct: str,
-) -> None:
+def _run_single_track_regen(job_id: str, lang_code: str, new_text: str, mode: str, exaggeration: float, cfg_weight: float, instruct: str, mastering_preset: str) -> None:
     job = store.get_job(job_id)
     if not job:
         return
@@ -535,12 +598,7 @@ def _run_single_track_regen(
     engine_id = job.get("engine_id", "qwen3")
     ref_wav_path = VOICES_DIR / voice["id"] / "clone_ref.wav"
     ref_text = str(voice.get("ref_text") or "")
-    effective_mode = (
-        engine_id
-        if engine_id in ("chatterbox", "cosyvoice3")
-        else ("xvector" if (mode == "xvector" or not ref_text.strip()) else "icl")
-    )
-    lang_meta = LANGUAGE_BY_CODE[lang_code]
+    effective_mode = engine_id if engine_id in ("chatterbox", "cosyvoice3") else ("xvector" if (mode == "xvector" or not ref_text.strip()) else "icl")
     job_dir = OUTPUTS_DIR / job_id
 
     try:
@@ -553,43 +611,25 @@ def _run_single_track_regen(
             ref_text=ref_text,
             mode=effective_mode,
             text=new_text,
-            lang_meta=lang_meta,
+            lang_meta=LANGUAGE_BY_CODE[lang_code],
             exaggeration=exaggeration,
             cfg_weight=cfg_weight,
             instruct=instruct,
             chunk_dir=job_dir / "chunks" / lang_code,
             enable_batch=enable_batch,
+            mastering_preset=mastering_preset,
             apply_watermark=apply_wm,
         )
         metrics = save_generated_audio(wav_np, sr, job_dir / f"{lang_code}.wav", job_dir / f"{lang_code}.mp3")
         for t in job["tracks"]:
             if t["lang_code"] == lang_code:
-                t.update(
-                    {
-                        "text": new_text,
-                        "status": "completed",
-                        "error": None,
-                        "elapsed_sec": elapsed,
-                        "rtf": rtf,
-                        "total_chunks": n_chunks,
-                        "watermarked": apply_wm,
-                        **metrics,
-                    }
-                )
+                t.update({"text": new_text, "status": "completed", "error": None, "elapsed_sec": elapsed, "rtf": rtf, "total_chunks": n_chunks, "mastering_preset": mastering_preset, "watermarked": apply_wm, **metrics})
                 break
         if job.get("reel"):
-            wav_paths = [
-                job_dir / f"{t['lang_code']}.wav"
-                for t in job["tracks"]
-                if t.get("status") == "completed" and (job_dir / f"{t['lang_code']}.wav").exists()
-            ]
+            wav_paths = [job_dir / f"{t['lang_code']}.wav" for t in job["tracks"] if t.get("status") == "completed" and (job_dir / f"{t['lang_code']}.wav").exists()]
             if len(wav_paths) >= 2:
                 reel_metrics = merge_multilingual_reel(wav_paths, job_dir / "multilingual_reel.mp3")
-                job["reel"] = {
-                    "lang_codes": [t["lang_code"] for t in job["tracks"] if t.get("status") == "completed"],
-                    "created_at": utc_now_iso(),
-                    **reel_metrics,
-                }
+                job["reel"] = {"lang_codes": [t["lang_code"] for t in job["tracks"] if t.get("status") == "completed"], "created_at": utc_now_iso(), **reel_metrics}
         job["completed_count"] = sum(1 for t in job["tracks"] if t.get("status") == "completed")
         job["failed_count"] = sum(1 for t in job["tracks"] if t.get("status") == "failed")
         job["status"] = "completed" if job["failed_count"] == 0 else "partial"
@@ -603,7 +643,97 @@ def _run_single_track_regen(
     store.save_job(job)
 
 
-# ---------- Video Dubbing Background Worker ----------
+def _run_podcast_job(podcast_id: str) -> None:
+    pod = store.get_podcast(podcast_id)
+    if not pod:
+        return
+    settings = store.get_settings(masked=False)
+    apply_wm = bool(settings.get("enable_watermark", True))
+    engine_id = pod.get("engine_id", "qwen3")
+    mastering_preset = pod.get("mastering_preset", "podcast")
+    pdir = PODCASTS_DIR / podcast_id
+    pdir.mkdir(parents=True, exist_ok=True)
+
+    pod["status"] = "loading_model"
+    store.save_podcast(pod)
+    try:
+        eng = engine_manager.prepare_engine(engine_id)
+    except Exception as exc:
+        pod["status"] = "failed"
+        pod["error"] = str(exc)
+        store.save_podcast(pod)
+        return
+
+    pod["status"] = "running"
+    store.save_podcast(pod)
+
+    turns_by_lang: Dict[str, List[Dict[str, Any]]] = pod.get("turns_by_lang", {})
+    speaker_voices: Dict[str, str] = pod.get("speaker_voices", {})
+    fallback_voice = store.list_voices()[0] if store.list_voices() else None
+    succeeded = 0
+
+    for track in pod["tracks"]:
+        code = track["lang_code"]
+        lang_meta = LANGUAGE_BY_CODE[code]
+        lang_turns = turns_by_lang.get(code, [])
+        track["status"] = "generating"
+        track["done_turns"] = 0
+        track["total_turns"] = len(lang_turns)
+        store.save_podcast(pod)
+
+        try:
+            t0 = time.perf_counter()
+            turn_audios = []
+            for idx, turn in enumerate(lang_turns):
+                spk = str(turn["speaker"])
+                vid = speaker_voices.get(spk) or (fallback_voice["id"] if fallback_voice else "")
+                v_obj = store.get_voice(vid) or fallback_voice
+                if not v_obj:
+                    raise RuntimeError(f"角色 {spk} 未绑定有效声纹。")
+                ref_wav = VOICES_DIR / v_obj["id"] / "clone_ref.wav"
+                ref_text = str(v_obj.get("ref_text") or "")
+                mode = pod.get("mode", "icl")
+                eff_mode = engine_id if engine_id in ("chatterbox", "cosyvoice3") else ("xvector" if (mode == "xvector" or not ref_text.strip()) else "icl")
+
+                wav_np, sr, _, _, _ = _synthesize_text_smart(
+                    eng=eng,
+                    engine_id=engine_id,
+                    voice_id=v_obj["id"],
+                    ref_wav_path=ref_wav,
+                    ref_text=ref_text,
+                    mode=eff_mode,
+                    text=str(turn["text"]),
+                    lang_meta=lang_meta,
+                    enable_batch=False,
+                    mastering_preset="raw",
+                    apply_watermark=False,
+                )
+                turn_audios.append((spk, wav_np, sr))
+                track["done_turns"] = idx + 1
+                pod["updated_at"] = utc_now_iso()
+                store.save_podcast(pod)
+
+            final_wav = assemble_podcast_audio(turn_audios, add_ambient_bgm=bool(pod.get("add_ambient_bgm", True)), target_sr=QWEN_SAMPLE_RATE)
+            if mastering_preset != "raw":
+                final_wav = apply_mastering_dsp(final_wav, QWEN_SAMPLE_RATE, mastering_preset)
+            if apply_wm:
+                final_wav = embed_watermark(final_wav, QWEN_SAMPLE_RATE)
+
+            metrics = save_generated_audio(final_wav, QWEN_SAMPLE_RATE, pdir / f"podcast_{code}.wav", pdir / f"podcast_{code}.mp3")
+            track.update({"status": "completed", "elapsed_sec": round(time.perf_counter() - t0, 2), "watermarked": apply_wm, **metrics})
+            succeeded += 1
+        except Exception as exc:
+            track["status"] = "failed"
+            track["error"] = str(exc)
+
+        pod["updated_at"] = utc_now_iso()
+        store.save_podcast(pod)
+
+    pod["status"] = "completed" if succeeded == len(pod["tracks"]) else ("partial" if succeeded > 0 else "failed")
+    pod["updated_at"] = utc_now_iso()
+    store.save_podcast(pod)
+
+
 def _run_video_dubbing_job(video_id: str, req_data: Dict[str, Any]) -> None:
     video = store.get_video(video_id)
     if not video:
@@ -612,51 +742,31 @@ def _run_video_dubbing_job(video_id: str, req_data: Dict[str, Any]) -> None:
     src_video = vdir / video["source_filename"]
     bgm_wav = vdir / "bgm_24k.wav"
     segments = video.get("segments", [])
+    speaker_profiles = {p["speaker"]: p for p in (video.get("speakers") or [])}
+    speaker_voice_map: Dict[str, str] = req_data.get("speaker_voices") or {}
+    default_voice_id = str(req_data.get("voice_id") or "auto_video")
+
     settings = store.get_settings(masked=False)
     apply_wm = bool(settings.get("enable_watermark", True))
-
-    voice_id = str(req_data.get("voice_id") or "auto_video")
-    if voice_id == "auto_video":
-        ref_wav = vdir / "auto_ref.wav"
-        ref_text = str(video.get("auto_ref_text") or "")
-        effective_voice_id = f"vid_{video_id}"
-    else:
-        v_obj = store.get_voice(voice_id)
-        if not v_obj:
-            video["dub_status"] = "failed"
-            video["dub_error"] = "所选声纹不存在。"
-            store.save_video(video)
-            return
-        ref_wav = VOICES_DIR / voice_id / "clone_ref.wav"
-        ref_text = str(v_obj.get("ref_text") or "")
-        effective_voice_id = voice_id
-
+    mastering_preset = str(req_data.get("mastering_preset") or "shorts")
+    subtitle_style = str(req_data.get("subtitle_style") or "cinema")
     engine_id = str(req_data.get("engine_id") or "qwen3")
     mode = str(req_data.get("mode") or "icl")
-    effective_mode = (
-        engine_id
-        if engine_id in ("chatterbox", "cosyvoice3")
-        else ("xvector" if (mode == "xvector" or not ref_text.strip()) else "icl")
-    )
 
     video["dub_status"] = "loading_model"
-    video["updated_at"] = utc_now_iso()
     store.save_video(video)
-
     try:
         eng = engine_manager.prepare_engine(engine_id)
     except Exception as exc:
         video["dub_status"] = "failed"
         video["dub_error"] = f"语音引擎加载失败: {exc}"
-        video["updated_at"] = utc_now_iso()
         store.save_video(video)
         return
 
     video["dub_status"] = "running"
-    video["updated_at"] = utc_now_iso()
     store.save_video(video)
-
     succeeded = 0
+
     for out_item in video.get("outputs", []):
         code = out_item["lang_code"]
         lang_meta = LANGUAGE_BY_CODE[code]
@@ -665,7 +775,6 @@ def _run_video_dubbing_job(video_id: str, req_data: Dict[str, Any]) -> None:
         out_item["done_segments"] = 0
         out_item["total_segments"] = len(segments)
         out_item["error"] = None
-        video["updated_at"] = utc_now_iso()
         store.save_video(video)
 
         try:
@@ -675,35 +784,57 @@ def _run_video_dubbing_job(video_id: str, req_data: Dict[str, Any]) -> None:
                 line_txt = (target_lines[s_idx] if s_idx < len(target_lines) else seg["text"]).strip()
                 if not line_txt:
                     continue
+                spk = str(seg.get("speaker") or "SPEAKER_1")
+                chosen_vid = speaker_voice_map.get(spk) or default_voice_id
+
+                if chosen_vid == "auto_video":
+                    prof = speaker_profiles.get(spk)
+                    ref_wav = (vdir / prof["ref_filename"]) if (prof and (vdir / prof["ref_filename"]).exists()) else (vdir / "auto_ref.wav")
+                    ref_text = str(prof["ref_text"]) if prof else str(video.get("auto_ref_text") or "")
+                    eff_vid = f"vid_{video_id}_{spk}"
+                else:
+                    v_obj = store.get_voice(chosen_vid)
+                    if not v_obj:
+                        raise RuntimeError(f"声纹 {chosen_vid} 不存在。")
+                    ref_wav = VOICES_DIR / chosen_vid / "clone_ref.wav"
+                    ref_text = str(v_obj.get("ref_text") or "")
+                    eff_vid = chosen_vid
+
+                eff_mode = engine_id if engine_id in ("chatterbox", "cosyvoice3") else ("xvector" if (mode == "xvector" or not ref_text.strip()) else "icl")
                 wav_np, sr, _, _, _ = _synthesize_text_smart(
                     eng=eng,
                     engine_id=engine_id,
-                    voice_id=effective_voice_id,
+                    voice_id=eff_vid,
                     ref_wav_path=ref_wav,
                     ref_text=ref_text,
-                    mode=effective_mode,
+                    mode=eff_mode,
                     text=line_txt,
                     lang_meta=lang_meta,
                     exaggeration=float(req_data.get("exaggeration", 0.5)),
                     cfg_weight=float(req_data.get("cfg_weight", 0.35)),
                     instruct=str(req_data.get("instruct") or ""),
                     enable_batch=False,
+                    mastering_preset=mastering_preset,
                     apply_watermark=apply_wm,
                 )
-                next_start = (
-                    float(segments[s_idx + 1]["start"])
-                    if s_idx + 1 < len(segments)
-                    else float(video["duration_sec"])
-                )
+                next_start = float(segments[s_idx + 1]["start"]) if s_idx + 1 < len(segments) else float(video["duration_sec"])
                 slot_budget = max(float(seg["end"]) - float(seg["start"]), next_start - float(seg["start"]) - 0.08)
                 fitted = fit_segment_tempo(wav_np, sr, slot_budget, vdir, f"{code}_{s_idx}")
                 placed.append((float(seg["start"]), fitted))
                 out_item["done_segments"] = s_idx + 1
-                video["updated_at"] = utc_now_iso()
                 store.save_video(video)
 
-            srt_target = write_srt(segments, target_lines, vdir / f"sub_{code}.srt", bilingual=False)
-            srt_bi = write_srt(segments, target_lines, vdir / f"sub_{code}_bilingual.srt", bilingual=True)
+            write_srt(segments, target_lines, vdir / f"sub_{code}.srt", bilingual=False)
+            write_srt(segments, target_lines, vdir / f"sub_{code}_bilingual.srt", bilingual=True)
+            ass_path = write_styled_ass(
+                segments,
+                target_lines,
+                vdir / f"sub_{code}.ass",
+                style_id=subtitle_style,
+                width=int(video.get("width") or 1280),
+                height=int(video.get("height") or 720),
+                bilingual=True,
+            )
 
             mux_metrics = mix_and_mux_dubbed_video(
                 video_path=src_video,
@@ -713,8 +844,9 @@ def _run_video_dubbing_job(video_id: str, req_data: Dict[str, Any]) -> None:
                 placed_segments=placed,
                 out_mp4_path=vdir / f"dub_{code}.mp4",
                 out_mp3_path=vdir / f"dub_{code}.mp3",
-                subtitle_srt_path=srt_bi,
+                subtitle_ass_path=ass_path,
                 burn_subtitles=bool(req_data.get("burn_subtitles", False)),
+                enable_lipsync=bool(req_data.get("enable_lipsync", False)),
                 bgm_volume=float(req_data.get("bgm_volume", 0.85)),
             )
             out_item.update(
@@ -722,6 +854,7 @@ def _run_video_dubbing_job(video_id: str, req_data: Dict[str, Any]) -> None:
                     "status": "completed",
                     "elapsed_sec": round(time.perf_counter() - t0, 2),
                     "burned_subtitles": bool(req_data.get("burn_subtitles", False)),
+                    "subtitle_style": subtitle_style,
                     **mux_metrics,
                 }
             )
@@ -738,7 +871,44 @@ def _run_video_dubbing_job(video_id: str, req_data: Dict[str, Any]) -> None:
     store.save_video(video)
 
 
-# ---------- Routes ----------
+def _analyze_video_file(src_path: Path, video_id: str, title: str, orig_filename: str, source_url: str = "") -> Dict[str, Any]:
+    vdir = src_path.parent
+    meta = probe_video(src_path)
+    stereo_wav, mono_24k = extract_video_audio(src_path, vdir)
+    vocals_wav, _, bgm_method = separate_vocals_and_bgm(stereo_wav, mono_24k, vdir)
+    asr_res = asr_service.transcribe_segments(vocals_wav)
+    segments = asr_res.get("segments") or []
+    if not segments:
+        raise ValueError("未在视频中检测到清晰人声台词。")
+    segments, speakers = diarize_video_segments(vocals_wav, segments, vdir)
+    auto_ref_text = speakers[0]["ref_text"] if speakers else ""
+
+    now = utc_now_iso()
+    record: Dict[str, Any] = {
+        "id": video_id,
+        "title": title[:48],
+        "original_filename": orig_filename,
+        "source_filename": src_path.name,
+        "source_url": source_url,
+        "bgm_method": bgm_method,
+        "detected_language": asr_res.get("language", "unknown"),
+        "full_transcript": asr_res.get("text", ""),
+        "segments": segments,
+        "speakers": speakers,
+        "auto_ref_text": auto_ref_text,
+        "translations": {},
+        "dub_status": "analyzed",
+        "dub_error": None,
+        "outputs": [],
+        "created_at": now,
+        "updated_at": now,
+        **meta,
+    }
+    store.save_video(record)
+    return record
+
+
+# ---------- Core System Routes ----------
 @app.get("/")
 def serve_index():
     index_path = FRONTEND_DIR / "index.html"
@@ -749,7 +919,7 @@ def serve_index():
 
 @app.get("/api/health")
 def health():
-    return {"ok": True, "service": "voxpoly-studio-v2", "requires_token": bool(ACCESS_TOKEN)}
+    return {"ok": True, "service": "voxpoly-studio-v3", "version": "3.0.0", "requires_token": bool(ACCESS_TOKEN)}
 
 
 @app.get("/api/system/status")
@@ -759,18 +929,20 @@ def system_status():
         "asr": asr_service.status,
         "features": {
             "demucs_available": has_demucs(),
+            "yt_dlp_available": has_yt_dlp(),
+            "lipsync_available": has_lipsync(),
             "access_token_enabled": bool(ACCESS_TOKEN),
             "qwen_batch_size": QWEN_BATCH_SIZE,
             "watermark_supported": True,
+            "openai_compat_url": "/v1/audio/speech",
         },
         "languages": LANGUAGES,
         "default_selected_langs": DEFAULT_SELECTED_LANGS,
         "presets": PRESET_SCENARIOS,
         "cosyvoice_presets": COSYVOICE_INSTRUCT_PRESETS,
-        "qwen_variants": [
-            {"id": k, "model_id": v["model_id"], "label": v["label"], "vram_gb": v["vram_gb"]}
-            for k, v in QWEN_VARIANTS.items()
-        ],
+        "mastering_presets": [{k: v for k, v in p.items() if k != "af"} for p in MASTERING_PRESETS],
+        "subtitle_styles": SUBTITLE_STYLES,
+        "qwen_variants": [{"id": k, "model_id": v["model_id"], "label": v["label"], "vram_gb": v["vram_gb"]} for k, v in QWEN_VARIANTS.items()],
         "settings": store.get_settings(masked=True),
     }
 
@@ -805,6 +977,119 @@ def update_settings(payload: SettingsPatch):
     return updated
 
 
+# ---------- OpenAI Compatible TTS API (/v1/models & /v1/audio/speech) ----------
+@app.get("/v1/models")
+def openai_list_models():
+    now = int(time.time())
+    models = [
+        {"id": "voxpoly-qwen3-1.7b", "object": "model", "created": now, "owned_by": "voxpoly-studio"},
+        {"id": "voxpoly-qwen3-0.6b", "object": "model", "created": now, "owned_by": "voxpoly-studio"},
+        {"id": "voxpoly-chatterbox-v3", "object": "model", "created": now, "owned_by": "voxpoly-studio"},
+        {"id": "voxpoly-cosyvoice3", "object": "model", "created": now, "owned_by": "voxpoly-studio"},
+        {"id": "tts-1", "object": "model", "created": now, "owned_by": "voxpoly-studio"},
+        {"id": "tts-1-hd", "object": "model", "created": now, "owned_by": "voxpoly-studio"},
+    ]
+    return {"object": "list", "data": models}
+
+
+@app.get("/v1/audio/voices")
+def openai_list_voices():
+    return {"voices": [{"id": v["id"], "name": v["name"], "duration_sec": v["duration_sec"]} for v in store.list_voices()]}
+
+
+@app.post("/v1/audio/speech")
+def openai_create_speech(payload: OpenAISpeechRequest):
+    voices = store.list_voices()
+    if not voices:
+        raise HTTPException(status_code=400, detail="声纹库为空，请先上传至少一段参考声纹。")
+
+    # Match by exact ID, display name, or fall back gracefully for OpenAI aliases (alloy/echo/nova/...)
+    chosen = next(
+        (v for v in voices if v["id"] == payload.voice or v["name"] == payload.voice),
+        voices[0],
+    )
+    model_l = payload.model.lower()
+    if "chatterbox" in model_l:
+        engine_id = "chatterbox"
+    elif "cosyvoice" in model_l:
+        engine_id = "cosyvoice3"
+    else:
+        engine_id = "qwen3"
+        if "0.6b" in model_l:
+            engine_manager.qwen3.set_variant("0.6b")
+
+    lang_code = payload.language if payload.language in LANGUAGE_BY_CODE else (detect_script_language(payload.input) or "en")
+    if engine_id not in LANGUAGE_BY_CODE[lang_code]["engines"]:
+        lang_code = "en"
+
+    settings = store.get_settings(masked=False)
+    mastering = payload.mastering_preset or str(settings.get("mastering_preset") or "raw")
+    apply_wm = bool(settings.get("enable_watermark", True))
+
+    eng = engine_manager.prepare_engine(engine_id)
+    ref_wav = VOICES_DIR / chosen["id"] / "clone_ref.wav"
+    ref_text = str(chosen.get("ref_text") or "")
+    eff_mode = engine_id if engine_id in ("chatterbox", "cosyvoice3") else ("icl" if ref_text.strip() else "xvector")
+
+    wav_np, sr, _, _, _ = _synthesize_text_smart(
+        eng=eng,
+        engine_id=engine_id,
+        voice_id=chosen["id"],
+        ref_wav_path=ref_wav,
+        ref_text=ref_text,
+        mode=eff_mode,
+        text=payload.input,
+        lang_meta=LANGUAGE_BY_CODE[lang_code],
+        enable_batch=bool(settings.get("enable_batch_accel", True)),
+        mastering_preset=mastering,
+        apply_watermark=apply_wm,
+    )
+
+    with tempfile.TemporaryDirectory(prefix="voxpoly_oai_") as tmp:
+        wav_p = Path(tmp) / "out.wav"
+        sf.write(str(wav_p), wav_np.astype(np.float32), sr, subtype="PCM_16")
+        if abs(payload.speed - 1.0) > 0.03:
+            sp_p = Path(tmp) / "speed.wav"
+            _run_ffmpeg(["-i", str(wav_p), "-af", f"atempo={payload.speed:.3f}", "-ac", "1", "-ar", str(sr), "-c:a", "pcm_s16le", str(sp_p)])
+            wav_p = sp_p
+
+        fmt = payload.response_format
+        if fmt == "wav":
+            return Response(content=wav_p.read_bytes(), media_type="audio/wav")
+        out_p = Path(tmp) / f"out.{fmt}"
+        codec_map = {
+            "mp3": (["-c:a", "libmp3lame", "-b:a", "192k"], "audio/mpeg"),
+            "flac": (["-c:a", "flac"], "audio/flac"),
+            "opus": (["-c:a", "libopus", "-b:a", "128k"], "audio/opus"),
+        }
+        c_args, mime = codec_map[fmt]
+        _run_ffmpeg(["-i", str(wav_p), *c_args, str(out_p)])
+        return Response(content=out_p.read_bytes(), media_type=mime)
+
+
+# ---------- Glossary Routes ----------
+@app.get("/api/glossary")
+def list_glossary():
+    return {"terms": glossary_store.list_terms()}
+
+
+@app.post("/api/glossary")
+def upsert_glossary(payload: GlossaryUpsert):
+    try:
+        rec = glossary_store.upsert_term(payload.model_dump())
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"term": rec, "terms": glossary_store.list_terms()}
+
+
+@app.delete("/api/glossary/{term_id}")
+def delete_glossary(term_id: str):
+    if not glossary_store.delete_term(term_id):
+        raise HTTPException(status_code=404, detail="未找到该词典条目。")
+    return {"deleted": True, "terms": glossary_store.list_terms()}
+
+
+# ---------- Watermark Verify ----------
 @app.post("/api/watermark/verify")
 async def verify_audio_watermark(file: UploadFile = File(...)):
     raw = await file.read()
@@ -816,13 +1101,127 @@ async def verify_audio_watermark(file: UploadFile = File(...)):
         wav_p = Path(tmp) / "in_24k.wav"
         raw_p.write_bytes(raw)
         try:
-            from backend.audio_utils import _run_ffmpeg
-
             _run_ffmpeg(["-i", str(raw_p), "-vn", "-ac", "1", "-ar", str(QWEN_SAMPLE_RATE), "-c:a", "pcm_s16le", str(wav_p)])
             audio, sr = load_wav_float32(wav_p)
             return {"filename": file.filename, **detect_watermark(audio, sr)}
         except Exception as exc:
             raise HTTPException(status_code=400, detail=f"音频解析失败: {exc}") from exc
+
+
+# ---------- Document Importer & Multi-Speaker Podcast Routes ----------
+@app.post("/api/documents/import-file")
+async def import_document_file(file: UploadFile = File(...)):
+    raw = await file.read()
+    if not raw:
+        raise HTTPException(status_code=400, detail="上传文档为空。")
+    try:
+        return {"document": parse_document_bytes(raw, file.filename or "doc.txt")}
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/documents/import-url")
+def import_document_url(payload: DocumentUrlRequest):
+    try:
+        return {"document": parse_url_article(payload.url)}
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/podcasts/script-from-text")
+def build_podcast_script(payload: PodcastScriptRequest):
+    try:
+        script, provider = generate_two_host_podcast_script(
+            source_text=payload.source_text,
+            settings=store.get_settings(masked=False),
+            host_a=payload.host_a,
+            host_b=payload.host_b,
+            target_lang=payload.target_lang,
+            style=payload.style,
+        )
+        turns, speakers = parse_dialogue_script(script)
+        return {"script_text": script, "turns": turns, "speakers": speakers, "provider": provider}
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/podcasts/generate")
+def create_podcast_job(payload: PodcastGenerateRequest):
+    turns, speakers = parse_dialogue_script(payload.script_text)
+    if not turns:
+        raise HTTPException(status_code=400, detail="未能解析出有效对话台词，请使用 [主持人]: 台词 格式。")
+    eng_st = engine_manager.get_engine(payload.engine_id).get_status()
+    if not eng_st["installed"]:
+        raise HTTPException(status_code=400, detail=f"{eng_st['display_name']} 尚未安装。")
+
+    valid_langs = [c for c in payload.target_langs if c in LANGUAGE_BY_CODE and payload.engine_id in LANGUAGE_BY_CODE[c]["engines"]]
+    if not valid_langs:
+        raise HTTPException(status_code=400, detail="请至少选择一个当前引擎支持的语种。")
+
+    turns_by_lang, provider, _ = translate_dialogue_turns(turns, valid_langs, store.get_settings(masked=False))
+    pod_id = f"pod_{uuid.uuid4().hex[:10]}"
+    now = utc_now_iso()
+    record: Dict[str, Any] = {
+        "id": pod_id,
+        "title": payload.title.strip() or "多角色播客",
+        "script_text": payload.script_text,
+        "speakers": speakers,
+        "speaker_voices": payload.speaker_voices,
+        "turns_by_lang": turns_by_lang,
+        "translation_provider": provider,
+        "engine_id": payload.engine_id,
+        "engine_name": eng_st["display_name"],
+        "mode": payload.mode,
+        "mastering_preset": payload.mastering_preset,
+        "add_ambient_bgm": payload.add_ambient_bgm,
+        "status": "queued",
+        "error": None,
+        "tracks": [
+            {
+                "lang_code": c,
+                "lang_label": LANGUAGE_BY_CODE[c]["label_zh"],
+                "region_tag": LANGUAGE_BY_CODE[c]["region_tag"],
+                "status": "pending",
+                "done_turns": 0,
+                "total_turns": len(turns),
+            }
+            for c in valid_langs
+        ],
+        "created_at": now,
+        "updated_at": now,
+    }
+    store.save_podcast(record)
+    threading.Thread(target=_run_podcast_job, args=(pod_id,), daemon=True).start()
+    return {"podcast": _decorate_podcast(record)}
+
+
+@app.get("/api/podcasts")
+def list_podcasts(limit: int = 20):
+    return {"podcasts": [_decorate_podcast(p) for p in store.list_podcasts(limit=limit)]}
+
+
+@app.get("/api/podcasts/{podcast_id}")
+def get_podcast(podcast_id: str):
+    pod = store.get_podcast(podcast_id)
+    if not pod:
+        raise HTTPException(status_code=404, detail="未找到该播客任务。")
+    return {"podcast": _decorate_podcast(pod)}
+
+
+@app.delete("/api/podcasts/{podcast_id}")
+def delete_podcast(podcast_id: str):
+    if not store.delete_podcast(podcast_id):
+        raise HTTPException(status_code=404, detail="未找到该播客任务。")
+    return {"deleted": True}
+
+
+@app.get("/api/podcasts/{podcast_id}/zip")
+def download_podcast_zip(podcast_id: str):
+    try:
+        zp = store.build_podcast_zip(podcast_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return FileResponse(path=str(zp), media_type="application/zip", filename=f"VoxPoly_Podcast_{podcast_id}.zip")
 
 
 # ---------- Voices ----------
@@ -832,22 +1231,16 @@ def list_voices():
 
 
 @app.post("/api/voices")
-async def create_voice(
-    file: UploadFile = File(...),
-    name: str = Form(default=""),
-    ref_text: str = Form(default=""),
-    auto_transcribe: bool = Form(default=True),
-):
+async def create_voice(file: UploadFile = File(...), name: str = Form(default=""), ref_text: str = Form(default=""), auto_transcribe: bool = Form(default=True)):
     filename = file.filename or "recording.webm"
     ext = Path(filename).suffix.lower() or ".wav"
     if ext not in ALLOWED_AUDIO_EXTS:
         raise HTTPException(status_code=400, detail=f"暂不支持的音频格式 {ext}。")
-
     raw_bytes = await file.read()
     if not raw_bytes:
         raise HTTPException(status_code=400, detail="上传文件为空。")
     if len(raw_bytes) > MAX_UPLOAD_MB * 1024 * 1024:
-        raise HTTPException(status_code=400, detail=f"文件体积超过 {MAX_UPLOAD_MB}MB 上限。")
+        raise HTTPException(status_code=400, detail=f"文件超过 {MAX_UPLOAD_MB}MB 上限。")
 
     voice_id = f"v_{uuid.uuid4().hex[:10]}"
     voice_dir = VOICES_DIR / voice_id
@@ -870,12 +1263,11 @@ async def create_voice(
             clean_ref = str(asr_res.get("text") or "").strip()
             detected_lang = str(asr_res.get("language") or "unknown")
         except Exception as exc:
-            asr_note = f"自动转写暂不可用（可手动填写参考文本）: {exc}"
+            asr_note = f"自动转写暂不可用: {exc}"
 
-    display_name = name.strip() or Path(filename).stem[:32] or f"我的声音 {voice_id[-4:]}"
     record: Dict[str, Any] = {
         "id": voice_id,
-        "name": display_name,
+        "name": name.strip() or Path(filename).stem[:32] or f"我的声音 {voice_id[-4:]}",
         "is_demo": False,
         "source_filename": filename,
         "ref_text": clean_ref,
@@ -891,20 +1283,11 @@ async def create_voice(
 
 @app.post("/api/voices/{voice_id}/transcribe")
 def transcribe_voice(voice_id: str):
-    voice = store.get_voice(voice_id)
-    if not voice:
+    if not store.get_voice(voice_id):
         raise HTTPException(status_code=404, detail="未找到该声纹档案。")
     clone_wav = VOICES_DIR / voice_id / "clone_ref.wav"
-    if not clone_wav.exists():
-        raise HTTPException(status_code=404, detail="参考音频文件缺失。")
-    try:
-        asr_res = asr_service.transcribe(clone_wav)
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"语音转写失败: {exc}") from exc
-    updated = store.update_voice_fields(
-        voice_id,
-        {"ref_text": asr_res["text"], "detected_language": asr_res["language"], "asr_note": None},
-    )
+    asr_res = asr_service.transcribe(clone_wav)
+    updated = store.update_voice_fields(voice_id, {"ref_text": asr_res["text"], "detected_language": asr_res["language"], "asr_note": None})
     engine_manager.invalidate_voice_cache(voice_id)
     return {"voice": _decorate_voice(updated), "asr": asr_res}
 
@@ -912,8 +1295,6 @@ def transcribe_voice(voice_id: str):
 @app.patch("/api/voices/{voice_id}")
 def patch_voice(voice_id: str, payload: VoicePatch):
     fields = {k: v.strip() for k, v in payload.model_dump(exclude_none=True).items()}
-    if not fields:
-        raise HTTPException(status_code=400, detail="没有需要更新的字段。")
     updated = store.update_voice_fields(voice_id, fields)
     if not updated:
         raise HTTPException(status_code=404, detail="未找到该声纹档案。")
@@ -932,12 +1313,11 @@ def delete_voice(voice_id: str):
 # ---------- Translation & Audio Jobs ----------
 @app.post("/api/translate")
 def api_translate(payload: TranslateRequest):
-    settings = store.get_settings(masked=False)
     try:
         translations, provider, warnings = translate_scripts(
             source_text=payload.source_text,
             target_langs=payload.target_langs,
-            settings=settings,
+            settings=store.get_settings(masked=False),
             source_lang=payload.source_lang,
         )
     except ValueError as exc:
@@ -951,21 +1331,17 @@ def api_translate(payload: TranslateRequest):
 def create_generation_job(payload: GenerateJobRequest):
     voice = store.get_voice(payload.voice_id)
     if not voice:
-        raise HTTPException(status_code=404, detail="所选声纹不存在，请先上传或选择一段录音。")
-
+        raise HTTPException(status_code=404, detail="所选声纹不存在。")
     eng_st = engine_manager.get_engine(payload.engine_id).get_status()
     if not eng_st["installed"]:
-        raise HTTPException(status_code=400, detail=f"{eng_st['display_name']} 尚未安装，请在 Colab Cell 2 勾选启用。")
+        raise HTTPException(status_code=400, detail=f"{eng_st['display_name']} 尚未安装。")
 
     ordered_tracks = []
     for lang in LANGUAGES:
         code = str(lang["code"])
         if code in payload.scripts and str(payload.scripts[code]).strip():
             if payload.engine_id not in lang["engines"]:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"当前引擎 {eng_st['display_name']} 不支持 {lang['label_zh']}。",
-                )
+                raise HTTPException(status_code=400, detail=f"{eng_st['display_name']} 不支持 {lang['label_zh']}。")
             txt = str(payload.scripts[code]).strip()
             ordered_tracks.append(
                 {
@@ -980,7 +1356,6 @@ def create_generation_job(payload: GenerateJobRequest):
                     "error": None,
                 }
             )
-
     if not ordered_tracks:
         raise HTTPException(status_code=400, detail="请至少填写一种语言的待合成文本。")
 
@@ -997,6 +1372,7 @@ def create_generation_job(payload: GenerateJobRequest):
         "exaggeration": payload.exaggeration,
         "cfg_weight": payload.cfg_weight,
         "instruct": payload.instruct.strip(),
+        "mastering_preset": payload.mastering_preset or str(store.get_settings(masked=False).get("mastering_preset") or "raw"),
         "source_text": (payload.source_text or "").strip(),
         "preset_id": payload.preset_id,
         "auto_reel": payload.auto_reel,
@@ -1033,7 +1409,7 @@ def get_job(job_id: str):
 def delete_job(job_id: str):
     if not store.delete_job(job_id):
         raise HTTPException(status_code=404, detail="未找到该生成任务。")
-    return {"deleted": True, "job_id": job_id}
+    return {"deleted": True}
 
 
 @app.post("/api/jobs/{job_id}/regenerate/{lang_code}")
@@ -1041,30 +1417,27 @@ def regenerate_track(job_id: str, lang_code: str, payload: RegenerateTrackReques
     job = store.get_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="未找到该生成任务。")
-    if lang_code not in LANGUAGE_BY_CODE:
-        raise HTTPException(status_code=400, detail=f"不支持的语种代码: {lang_code}")
     target_track = next((t for t in job["tracks"] if t["lang_code"] == lang_code), None)
     if not target_track:
         raise HTTPException(status_code=404, detail=f"任务中不包含语种 {lang_code}")
-
     new_text = (payload.text if payload.text is not None else target_track["text"]).strip()
-    if not new_text:
-        raise HTTPException(status_code=400, detail="待合成文本不能为空。")
-    mode = payload.mode or job.get("mode", "icl")
-    exaggeration = float(payload.exaggeration if payload.exaggeration is not None else job.get("exaggeration", 0.5))
-    cfg_weight = float(payload.cfg_weight if payload.cfg_weight is not None else job.get("cfg_weight", 0.35))
-    instruct = payload.instruct if payload.instruct is not None else str(job.get("instruct") or "")
-
     target_track["text"] = new_text
     target_track["status"] = "generating"
     target_track["error"] = None
     job["status"] = "running"
-    job["updated_at"] = utc_now_iso()
     store.save_job(job)
-
     threading.Thread(
         target=_run_single_track_regen,
-        args=(job_id, lang_code, new_text, mode, exaggeration, cfg_weight, instruct),
+        args=(
+            job_id,
+            lang_code,
+            new_text,
+            payload.mode or job.get("mode", "icl"),
+            float(payload.exaggeration if payload.exaggeration is not None else job.get("exaggeration", 0.5)),
+            float(payload.cfg_weight if payload.cfg_weight is not None else job.get("cfg_weight", 0.35)),
+            payload.instruct if payload.instruct is not None else str(job.get("instruct") or ""),
+            payload.mastering_preset or str(job.get("mastering_preset") or "raw"),
+        ),
         daemon=True,
     ).start()
     return {"job": _decorate_job(job)}
@@ -1076,16 +1449,12 @@ def build_reel(job_id: str, payload: ReelRequest):
     if not job:
         raise HTTPException(status_code=404, detail="未找到该生成任务。")
     job_dir = OUTPUTS_DIR / job_id
-    chosen_codes = payload.lang_codes or [t["lang_code"] for t in job["tracks"] if t.get("status") == "completed"]
-    wav_paths = [job_dir / f"{code}.wav" for code in chosen_codes if (job_dir / f"{code}.wav").exists()]
+    chosen = payload.lang_codes or [t["lang_code"] for t in job["tracks"] if t.get("status") == "completed"]
+    wav_paths = [job_dir / f"{c}.wav" for c in chosen if (job_dir / f"{c}.wav").exists()]
     if not wav_paths:
-        raise HTTPException(status_code=400, detail="没有已完成的音轨可用于合成串烧。")
-    try:
-        reel_metrics = merge_multilingual_reel(wav_paths, job_dir / "multilingual_reel.mp3", gap_sec=payload.gap_sec)
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"合成串烧失败: {exc}") from exc
+        raise HTTPException(status_code=400, detail="没有已完成音轨。")
+    reel_metrics = merge_multilingual_reel(wav_paths, job_dir / "multilingual_reel.mp3", gap_sec=payload.gap_sec)
     job["reel"] = {"lang_codes": [p.stem for p in wav_paths], "created_at": utc_now_iso(), **reel_metrics}
-    job["updated_at"] = utc_now_iso()
     store.save_job(job)
     return {"job": _decorate_job(job)}
 
@@ -1093,13 +1462,13 @@ def build_reel(job_id: str, payload: ReelRequest):
 @app.get("/api/jobs/{job_id}/zip")
 def download_job_zip(job_id: str):
     try:
-        zip_path = store.build_job_zip(job_id)
+        zp = store.build_job_zip(job_id)
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
-    return FileResponse(path=str(zip_path), media_type="application/zip", filename=f"VoxPoly_{job_id}.zip")
+    return FileResponse(path=str(zp), media_type="application/zip", filename=f"VoxPoly_{job_id}.zip")
 
 
-# ---------- Video Multilingual Dubbing Routes ----------
+# ---------- Video Dubbing V3 Routes ----------
 @app.get("/api/videos")
 def list_videos(limit: int = 15):
     return {"videos": [_decorate_video(v) for v in store.list_videos(limit=limit)]}
@@ -1109,15 +1478,15 @@ def list_videos(limit: int = 15):
 def get_video(video_id: str):
     video = store.get_video(video_id)
     if not video:
-        raise HTTPException(status_code=404, detail="未找到该视频译配任务。")
+        raise HTTPException(status_code=404, detail="未找到该视频记录。")
     return {"video": _decorate_video(video)}
 
 
 @app.delete("/api/videos/{video_id}")
 def delete_video(video_id: str):
     if not store.delete_video(video_id):
-        raise HTTPException(status_code=404, detail="未找到该视频译配任务。")
-    return {"deleted": True, "video_id": video_id}
+        raise HTTPException(status_code=404, detail="未找到该视频记录。")
+    return {"deleted": True}
 
 
 @app.post("/api/videos/analyze")
@@ -1125,55 +1494,36 @@ async def analyze_uploaded_video(file: UploadFile = File(...)):
     filename = file.filename or "input.mp4"
     ext = Path(filename).suffix.lower() or ".mp4"
     if ext not in ALLOWED_VIDEO_EXTS:
-        raise HTTPException(status_code=400, detail=f"暂不支持的视频格式 {ext}，支持 mp4/mov/mkv/webm。")
-
+        raise HTTPException(status_code=400, detail=f"暂不支持的视频格式 {ext}。")
     raw_bytes = await file.read()
-    if not raw_bytes:
-        raise HTTPException(status_code=400, detail="上传视频为空。")
-    if len(raw_bytes) > MAX_VIDEO_MB * 1024 * 1024:
-        raise HTTPException(status_code=400, detail=f"视频超过 {MAX_VIDEO_MB}MB 上限。")
+    if not raw_bytes or len(raw_bytes) > MAX_VIDEO_MB * 1024 * 1024:
+        raise HTTPException(status_code=400, detail=f"视频为空或超过 {MAX_VIDEO_MB}MB 上限。")
 
     video_id = f"vid_{uuid.uuid4().hex[:10]}"
     vdir = VIDEOS_DIR / video_id
     vdir.mkdir(parents=True, exist_ok=True)
-    src_name = f"source{ext}"
-    src_path = vdir / src_name
+    src_path = vdir / f"source{ext}"
     src_path.write_bytes(raw_bytes)
-
     try:
-        meta = probe_video(src_path)
-        stereo_wav, mono_24k = extract_video_audio(src_path, vdir)
-        vocals_wav, bgm_wav, bgm_method = separate_vocals_and_bgm(stereo_wav, mono_24k, vdir)
-        asr_res = asr_service.transcribe_segments(vocals_wav)
-        segments = asr_res.get("segments") or []
-        if not segments:
-            raise ValueError("未在视频中检测到清晰人声台词，请换一段包含人声讲解的视频。")
-        _, auto_ref_text = extract_best_voice_reference(vocals_wav, segments, vdir / "auto_ref.wav")
+        rec = _analyze_video_file(src_path, video_id, Path(filename).stem, filename)
     except Exception as exc:
         shutil.rmtree(vdir, ignore_errors=True)
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"video": _decorate_video(rec)}
 
-    now = utc_now_iso()
-    record: Dict[str, Any] = {
-        "id": video_id,
-        "title": Path(filename).stem[:40],
-        "original_filename": filename,
-        "source_filename": src_name,
-        "bgm_method": bgm_method,
-        "detected_language": asr_res.get("language", "unknown"),
-        "full_transcript": asr_res.get("text", ""),
-        "segments": segments,
-        "auto_ref_text": auto_ref_text,
-        "translations": {},
-        "dub_status": "analyzed",
-        "dub_error": None,
-        "outputs": [],
-        "created_at": now,
-        "updated_at": now,
-        **meta,
-    }
-    store.save_video(record)
-    return {"video": _decorate_video(record)}
+
+@app.post("/api/videos/import-url")
+def import_video_url(payload: VideoUrlImportRequest):
+    video_id = f"vid_{uuid.uuid4().hex[:10]}"
+    vdir = VIDEOS_DIR / video_id
+    vdir.mkdir(parents=True, exist_ok=True)
+    try:
+        src_path, title = download_video_from_url(payload.url, vdir)
+        rec = _analyze_video_file(src_path, video_id, title, src_path.name, source_url=payload.url)
+    except Exception as exc:
+        shutil.rmtree(vdir, ignore_errors=True)
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"video": _decorate_video(rec)}
 
 
 @app.post("/api/videos/{video_id}/translate")
@@ -1183,18 +1533,12 @@ def translate_video_segments(video_id: str, payload: VideoTranslateRequest):
         raise HTTPException(status_code=404, detail="未找到该视频记录。")
     if payload.segments:
         video["segments"] = payload.segments
-    segments = video.get("segments", [])
-    settings = store.get_settings(masked=False)
-    try:
-        translations, provider, warnings = translate_segments_for_dubbing(
-            segments=segments,
-            target_langs=payload.target_langs,
-            settings=settings,
-            source_lang=video.get("detected_language"),
-        )
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
-
+    translations, provider, warnings = translate_segments_for_dubbing(
+        segments=video.get("segments", []),
+        target_langs=payload.target_langs,
+        settings=store.get_settings(masked=False),
+        source_lang=video.get("detected_language"),
+    )
     video["translations"] = {**(video.get("translations") or {}), **translations}
     video["updated_at"] = utc_now_iso()
     store.save_video(video)
@@ -1214,7 +1558,7 @@ def start_video_dubbing(video_id: str, payload: VideoDubRequest):
     for code in payload.target_langs:
         lang = LANGUAGE_BY_CODE.get(code)
         if not lang or payload.engine_id not in lang["engines"]:
-            raise HTTPException(status_code=400, detail=f"引擎 {eng_st['display_name']} 不支持语种 {code}。")
+            raise HTTPException(status_code=400, detail=f"{eng_st['display_name']} 不支持语种 {code}。")
         outputs.append(
             {
                 "lang_code": code,
@@ -1244,7 +1588,7 @@ def start_video_dubbing(video_id: str, payload: VideoDubRequest):
 @app.get("/api/videos/{video_id}/zip")
 def download_video_zip(video_id: str):
     try:
-        zip_path = store.build_video_zip(video_id)
+        zp = store.build_video_zip(video_id)
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
-    return FileResponse(path=str(zip_path), media_type="application/zip", filename=f"VoxPoly_Video_{video_id}.zip")
+    return FileResponse(path=str(zp), media_type="application/zip", filename=f"VoxPoly_Video_{video_id}.zip")

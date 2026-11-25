@@ -4,7 +4,7 @@ setlocal EnableDelayedExpansion
 cd /d "%~dp0"
 
 echo ============================================================
-echo   VoxPoly Studio V2.0 Pro - Windows Auto GPU Installer
+echo   VoxPoly Studio V3.0 Pro - Windows Auto GPU Installer
 echo ============================================================
 echo.
 

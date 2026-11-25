@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import httpx
 
 from backend.config import LANGUAGE_BY_CODE
+from backend.glossary import protect_terms_for_translation, restore_terms_after_translation
 
 
 def detect_script_language(text: str) -> Optional[str]:
@@ -121,11 +122,13 @@ def _translate_single_free(source_text: str, lang_code: str, detected_lang: Opti
     meta = LANGUAGE_BY_CODE[lang_code]
     errors: List[str] = []
 
-    # Preserve paragraph breaks for long-form texts cleanly
+    # Preserve paragraph breaks & protect glossary terms
     paragraphs = [p.strip() for p in re.split(r"\n\s*\n+", source_text) if p.strip()]
     if len(paragraphs) > 1:
         translated_paras = [_translate_single_free(p, lang_code, detected_lang) for p in paragraphs]
         return "\n\n".join(translated_paras)
+
+    masked_text, restore_map = protect_terms_for_translation(source_text, lang_code)
 
     # Tier 1: Google Translate gtx JSON endpoint (handles all 23 languages cleanly)
     try:
@@ -139,7 +142,7 @@ def _translate_single_free(source_text: str, lang_code: str, detected_lang: Opti
                     else "auto",
                     "tl": str(meta["translator_code"]),
                     "dt": "t",
-                    "q": source_text,
+                    "q": masked_text,
                 },
                 headers={"User-Agent": "Mozilla/5.0"},
             )
@@ -147,7 +150,7 @@ def _translate_single_free(source_text: str, lang_code: str, detected_lang: Opti
             payload = resp.json()
             if isinstance(payload, list) and payload and isinstance(payload[0], list):
                 joined = "".join(str(seg[0]) for seg in payload[0] if isinstance(seg, list) and seg and seg[0])
-                joined = _clean_translated_text(joined)
+                joined = restore_terms_after_translation(_clean_translated_text(joined), restore_map)
                 if joined:
                     return joined
     except Exception as exc:
@@ -160,10 +163,10 @@ def _translate_single_free(source_text: str, lang_code: str, detected_lang: Opti
         src_mm = (
             str(LANGUAGE_BY_CODE[detected_lang]["mymemory_code"])
             if detected_lang in LANGUAGE_BY_CODE
-            else ("zh-CN" if re.search(r"[\u4e00-\u9fff]", source_text) else "en-US")
+            else ("zh-CN" if re.search(r"[\u4e00-\u9fff]", masked_text) else "en-US")
         )
-        res = MyMemoryTranslator(source=src_mm, target=str(meta["mymemory_code"])).translate(source_text)
-        res = _clean_translated_text(res or "")
+        res = MyMemoryTranslator(source=src_mm, target=str(meta["mymemory_code"])).translate(masked_text)
+        res = restore_terms_after_translation(_clean_translated_text(res or ""), restore_map)
         if res:
             return res
     except Exception as exc:
@@ -173,8 +176,8 @@ def _translate_single_free(source_text: str, lang_code: str, detected_lang: Opti
     try:
         from deep_translator import GoogleTranslator
 
-        res = GoogleTranslator(source="auto", target=str(meta["translator_code"])).translate(source_text)
-        res = _clean_translated_text(res or "")
+        res = GoogleTranslator(source="auto", target=str(meta["translator_code"])).translate(masked_text)
+        res = restore_terms_after_translation(_clean_translated_text(res or ""), restore_map)
         if res:
             return res
     except Exception as exc:

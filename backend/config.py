@@ -9,6 +9,7 @@ DATA_DIR = Path(os.getenv("VOXPOLY_DATA_DIR", str(BASE_DIR / "data"))).resolve()
 MODELS_DIR = DATA_DIR / "models"
 VOICES_DIR = DATA_DIR / "voices"
 OUTPUTS_DIR = DATA_DIR / "outputs"
+PODCASTS_DIR = DATA_DIR / "podcasts"
 VIDEOS_DIR = DATA_DIR / "videos"
 WHISPER_DIR = Path(os.getenv("VOXPOLY_WHISPER_DIR", str(MODELS_DIR / "whisper"))).resolve()
 SETTINGS_FILE = DATA_DIR / "settings.local.json"
@@ -59,6 +60,11 @@ COSYVOICE_REPO_DIR = os.getenv("VOXPOLY_COSYVOICE_REPO", "/content/CosyVoice").s
 COSYVOICE_MODEL_ID = os.getenv("VOXPOLY_COSYVOICE_MODEL_ID", "FunAudioLLM/Fun-CosyVoice3-0.5B-2512").strip()
 COSYVOICE_LOCAL_DIR = MODELS_DIR / "Fun-CosyVoice3-0.5B"
 
+# Optional Isolated Lip-Sync Worker (MuseTalk / Wav2Lip on Colab L4/A100)
+LIPSYNC_PYTHON = os.getenv("VOXPOLY_LIPSYNC_PYTHON", "/content/lipsync_env/bin/python").strip()
+LIPSYNC_REPO_DIR = os.getenv("VOXPOLY_LIPSYNC_REPO", "/content/MuseTalk").strip()
+LIPSYNC_BACKEND = os.getenv("VOXPOLY_LIPSYNC_BACKEND", "musetalk").strip().lower()
+
 # Optional passcode when sharing public Cloudflare HTTPS link
 ACCESS_TOKEN = os.getenv("VOXPOLY_ACCESS_TOKEN", "").strip()
 
@@ -67,7 +73,7 @@ MIN_REF_AUDIO_SECONDS = 1.5
 MAX_UPLOAD_MB = 50
 MAX_VIDEO_MB = 300
 
-for _d in (DATA_DIR, MODELS_DIR, VOICES_DIR, OUTPUTS_DIR, VIDEOS_DIR, WHISPER_DIR):
+for _d in (DATA_DIR, MODELS_DIR, VOICES_DIR, OUTPUTS_DIR, PODCASTS_DIR, VIDEOS_DIR, WHISPER_DIR):
     _d.mkdir(parents=True, exist_ok=True)
 
 

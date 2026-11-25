@@ -1,0 +1,24 @@
+services:
+  voxpoly-studio:
+    build: .
+    container_name: voxpoly-studio
+    restart: unless-stopped
+    ports:
+      - "8765:8765"
+    volumes:
+      - ./data:/app/data
+    environment:
+      - VOXPOLY_DATA_DIR=/app/data
+      - VOXPOLY_DOWNLOAD_SOURCE=hf
+      - VOXPOLY_QWEN_VARIANT=1.7b
+      - VOXPOLY_WHISPER_MODEL=small
+      - VOXPOLY_QWEN_BATCH_SIZE=3
+      # Optional passcode lock when exposing outside localhost:
+      - VOXPOLY_ACCESS_TOKEN=
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]

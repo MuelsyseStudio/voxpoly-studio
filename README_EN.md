@@ -1,8 +1,8 @@
 <div align="center">
 
-# 🎙️ VoxPoly Studio V2.0 Pro
+# 🎙️ VoxPoly Studio V3.0 Pro
 
-**Open-Source Multilingual Zero-Shot Voice Cloning, Long-Form Narration & One-Click Video Dubbing Studio**
+**Open-Source Multilingual Voice Cloning, Two-Host AI Podcast & Audiobook Studio, Multi-Speaker Video Dubbing, OpenAI TTS API & MCP Server**
 
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache%202.0-0D6E6E.svg)](./LICENSE)
 [![Python 3.10-3.12](https://img.shields.io/badge/Python-3.10%20--%203.12-blue.svg)](#quick-start)
@@ -16,19 +16,26 @@
 
 </div>
 
-## Highlights
+## What's New in V3.0 Pro
 
 - **3 Conflict-Free Neural Engines (Isolated Workers + Auto VRAM Reclamation)**
   - **Qwen3-TTS 12Hz Base** (`1.7B` & low-VRAM `0.6B` switcher, Apache-2.0): 10 languages, ICL high-fidelity alignment, x-vector cross-lingual cloning, and **true batched long-form synthesis**.
-  - **Chatterbox Multilingual V3** (MIT): **23 languages** (adding Arabic, Hindi, Turkish, Dutch, Polish, Nordic languages, Hebrew, Greek, Malay, Swahili) with `exaggeration` & `cfg_weight` controls.
-  - **Fun-CosyVoice 3.0** (Apache-2.0): 9 languages, 18+ Chinese dialects, natural-language emotion/style instructions, and `[laughter]` / `[breath]` tags.
-- **One-Click Multilingual Video Dubbing**
-  - Upload `MP4 / MOV / WebM` → **Demucs (`htdemucs`)** vocal/BGM separation (with FFmpeg ducking fallback) → Whisper timestamped segmentation → auto speaker voiceprint extraction → duration-aware translation → pitch-preserving `atempo` sync → lossless MP4 muxing + bilingual & single-language `.srt` export.
-- **Long-Form Smart Chunker + Live Chunk Preview**
-  - Splits 500–8,000 char scripts cleanly on paragraph/sentence boundaries, levels loudness across chunks, and plays Chunk 1 while subsequent chunks finish generating.
-- **Imperceptible Acoustic Watermark & Verifier**
-  - Spread-spectrum watermark (`7.2–9.6 kHz`, survives 192kbps MP3 compression) embedded by default, paired with a built-in verification tab.
-- **Broad Hardware Support**: NVIDIA RTX 50 (`cu128`), RTX 30/40/A100/L4 (`bf16+TF32`), RTX 20/16/T4 (auto `fp16`), **Apple Silicon M1–M4 (`MPS`)**, Linux AMD ROCm, and CPU fallback (`0.6B`).
+  - **Chatterbox Multilingual V3** (MIT): **23 languages** (Arabic, Hindi, Turkish, Dutch, Polish, Nordic languages, Hebrew, Greek, Malay, Swahili, etc.) with `exaggeration` & `cfg_weight` controls.
+  - **Fun-CosyVoice 3.0** (Apache-2.0): 9 languages, 18+ Chinese dialects, natural-language style instructions, and `[laughter]` / `[breath]` tags.
+- **Two-Host AI Podcast & Document-to-Audiobook Studio**
+  - Import **Web URLs, PDF, EPUB, Markdown, TXT, or HTML** with automatic chapter detection.
+  - Send chapters straight to long-form audiobook synthesis (`-18 LUFS`) or adapt into a **NotebookLM-style two-host podcast script** (`[Host]: ...` / `[Guest]: ...`) with per-role voiceprints, multilingual rendering, and optional copyright-free warm Lo-Fi ambient bed.
+- **Video Dubbing Pro**
+  - Paste **YouTube / Bilibili / X / TikTok URLs** (`yt-dlp`) or drag-and-drop local MP4/MOV/WebM.
+  - **Zero-token acoustic multi-speaker diarization** automatically detects multiple speakers, extracts per-speaker reference clips, and lets you map voices per speaker.
+  - **3 Bilingual Styled ASS Subtitle Presets** (`cinema`, `shorts_yellow` for 9:16 Reels/TikTok/Shorts, `minimal_bar`) + optional isolated **MuseTalk Lip-Sync GPU worker** on Colab L4/A100.
+- **Pronunciation & Brand Glossary + Broadcast Mastering DSP**
+  - Lock brand names and acronyms from mistranslation and set per-language phonetic TTS overrides globally.
+  - 4 broadcast FFmpeg mastering chains (`raw`, `podcast -16 LUFS`, `shorts -14 LUFS`, `audiobook -18 LUFS`), applied *before* spread-spectrum watermarking so watermarks stay 100% detectable.
+- **OpenAI-Compatible TTS API, Built-in MCP Server, CLI & Docker**
+  - Plug `http://127.0.0.1:8765/v1` directly into **Cherry Studio, OpenWebUI, LobeChat, or Obsidian** (`/v1/audio/speech`).
+  - Zero-dependency stdio **MCP Server** (`python -m backend.mcp_server`) exposing 5 tools for Antigravity, Claude Desktop, and Cursor.
+  - **CLI** (`python -m backend.cli speak | batch | voices | verify`) and **NVIDIA GPU `docker-compose.yml`**.
 
 ## Quick Start
 
@@ -51,7 +58,33 @@ chmod +x install_linux_mac.sh start_linux_mac.sh
 ./start_linux_mac.sh
 ```
 
+**Docker (NVIDIA GPU):**
+```bash
+docker compose up -d
+```
+
 Open `http://127.0.0.1:8765/` in your browser.
+
+## OpenAI API & MCP Integration
+
+```bash
+curl -X POST http://127.0.0.1:8765/v1/audio/speech \
+  -H "Content-Type: application/json" \
+  -d '{"model":"voxpoly-qwen3-1.7b","voice":"demo_official","input":"Hello from VoxPoly V3!","response_format":"mp3"}' \
+  --output hello.mp3
+```
+
+```json
+{
+  "mcpServers": {
+    "voxpoly": {
+      "command": "python",
+      "args": ["-m", "backend.mcp_server"],
+      "env": { "VOXPOLY_API_URL": "http://127.0.0.1:8765" }
+    }
+  }
+}
+```
 
 ## Hardware Compatibility
 

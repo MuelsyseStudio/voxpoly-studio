@@ -8,10 +8,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from backend.config import DEFAULT_QWEN_VARIANT, OUTPUTS_DIR, SETTINGS_FILE, VIDEOS_DIR, VOICES_DIR
+from backend.config import DEFAULT_QWEN_VARIANT, OUTPUTS_DIR, PODCASTS_DIR, SETTINGS_FILE, VIDEOS_DIR, VOICES_DIR
 
 VOICES_INDEX = VOICES_DIR / "index.json"
 JOBS_INDEX = OUTPUTS_DIR / "index.json"
+PODCASTS_INDEX = PODCASTS_DIR / "index.json"
 VIDEOS_INDEX = VIDEOS_DIR / "index.json"
 
 DEFAULT_SETTINGS: Dict[str, Any] = {
@@ -20,6 +21,7 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "llm_api_key": "",
     "llm_model": "deepseek-chat",
     "qwen_variant": DEFAULT_QWEN_VARIANT,
+    "mastering_preset": "raw",
     "enable_watermark": True,
     "enable_batch_accel": True,
     "idle_unload_minutes": 0,
@@ -36,11 +38,12 @@ class StudioStore:
         self._ensure_files()
 
     def _ensure_files(self) -> None:
-        for d in (VOICES_DIR, OUTPUTS_DIR, VIDEOS_DIR):
+        for d in (VOICES_DIR, OUTPUTS_DIR, PODCASTS_DIR, VIDEOS_DIR):
             d.mkdir(parents=True, exist_ok=True)
         for p, default in (
             (VOICES_INDEX, []),
             (JOBS_INDEX, []),
+            (PODCASTS_INDEX, []),
             (VIDEOS_INDEX, []),
             (SETTINGS_FILE, DEFAULT_SETTINGS),
         ):
@@ -91,6 +94,8 @@ class StudioStore:
                 cur["enable_batch_accel"] = bool(patch["enable_batch_accel"])
             if "qwen_variant" in patch and patch["qwen_variant"] in ("1.7b", "0.6b"):
                 cur["qwen_variant"] = patch["qwen_variant"]
+            if "mastering_preset" in patch and patch["mastering_preset"] in ("raw", "podcast", "shorts", "audiobook"):
+                cur["mastering_preset"] = patch["mastering_preset"]
             if "idle_unload_minutes" in patch:
                 cur["idle_unload_minutes"] = max(0, min(120, int(patch["idle_unload_minutes"])))
             if "llm_api_key" in patch:
@@ -261,6 +266,56 @@ class StudioStore:
                     if p.exists():
                         zf.write(p, arcname=arc)
             zf.writestr("video_manifest.json", json.dumps(video, ensure_ascii=False, indent=2).encode("utf-8"))
+        return zip_path
+
+    # ---------- Multi-Speaker Podcasts ----------
+    def list_podcasts(self, limit: int = 20) -> List[Dict[str, Any]]:
+        with self._lock:
+            return self._read_json(PODCASTS_INDEX, [])[:limit]
+
+    def get_podcast(self, podcast_id: str) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            return next((p for p in self._read_json(PODCASTS_INDEX, []) if p["id"] == podcast_id), None)
+
+    def save_podcast(self, podcast: Dict[str, Any]) -> Dict[str, Any]:
+        with self._lock:
+            items = self._read_json(PODCASTS_INDEX, [])
+            for idx, existing in enumerate(items):
+                if existing["id"] == podcast["id"]:
+                    items[idx] = podcast
+                    break
+            else:
+                items.insert(0, podcast)
+            self._write_json(PODCASTS_INDEX, items[:50])
+            return podcast
+
+    def delete_podcast(self, podcast_id: str) -> bool:
+        with self._lock:
+            items = self._read_json(PODCASTS_INDEX, [])
+            new_items = [p for p in items if p["id"] != podcast_id]
+            if len(new_items) == len(items):
+                return False
+            self._write_json(PODCASTS_INDEX, new_items)
+            shutil.rmtree(PODCASTS_DIR / podcast_id, ignore_errors=True)
+            return True
+
+    def build_podcast_zip(self, podcast_id: str) -> Path:
+        pod = self.get_podcast(podcast_id)
+        if not pod:
+            raise FileNotFoundError(f"未找到播客任务: {podcast_id}")
+        pdir = PODCASTS_DIR / podcast_id
+        zip_path = pdir / f"voxpoly_podcast_{podcast_id}.zip"
+        with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            for tr in pod.get("tracks", []):
+                if tr.get("status") != "completed":
+                    continue
+                code = tr["lang_code"]
+                for ext in ("mp3", "wav"):
+                    f = pdir / f"podcast_{code}.{ext}"
+                    if f.exists():
+                        zf.write(f, arcname=f"podcast_{code}.{ext}")
+            zf.writestr("dialogue_script.txt", str(pod.get("script_text") or "").encode("utf-8"))
+            zf.writestr("podcast_manifest.json", json.dumps(pod, ensure_ascii=False, indent=2).encode("utf-8"))
         return zip_path
 
 

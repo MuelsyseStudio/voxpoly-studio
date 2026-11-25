@@ -18,7 +18,7 @@ for arg in "$@"; do
 done
 
 echo "============================================================"
-echo "  VoxPoly Studio V2.0 Pro - Linux / macOS Installer"
+echo "  VoxPoly Studio V3.0 Pro - Linux / macOS Installer"
 echo "============================================================"
 
 if ! command -v ffmpeg >/dev/null 2>&1; then
