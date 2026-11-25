@@ -16,7 +16,7 @@
   ].join("\n");
 
   const state = {
-    accessToken: localStorage.getItem("voxpoly_access_token") || "",
+    authRequired: false,
     workspaceTab: "audio",
     languages: [],
     presets: [],
@@ -122,11 +122,12 @@
 
   async function apiFetch(url, options = {}) {
     const headers = new Headers(options.headers || {});
-    if (state.accessToken) headers.set("X-Access-Token", state.accessToken);
-    const resp = await fetch(url, { ...options, headers });
+    headers.set("X-VoxPoly-Request", "1");
+    const resp = await fetch(url, { credentials: "same-origin", ...options, headers });
     let data = null;
     try { data = await resp.json(); } catch { data = null; }
     if (resp.status === 401) {
+      state.authRequired = true;
       $("tokenModal").hidden = false;
       throw new Error(data?.detail || "需要访问口令");
     }
@@ -1888,20 +1889,24 @@
   function renderDeveloperSnippets() {
     const origin = window.location.origin;
     const sampleVoice = state.selectedVoiceId || state.voices[0]?.id || "demo_official";
+    const needAuth = Boolean(state.features.access_token_enabled);
+    const authHeaderLine = needAuth ? ` \\\n  -H "Authorization: Bearer <YOUR_ACCESS_TOKEN>"` : "";
     $("snippetOpenAI").textContent =
 `# Base URL: ${origin}/v1
-curl -X POST ${origin}/v1/audio/speech \\
+curl -X POST ${origin}/v1/audio/speech${authHeaderLine} \\
   -H "Content-Type: application/json" \\
   -d '{"model":"voxpoly-qwen3-1.7b","voice":"${sampleVoice}","input":"你好，这是通过 OpenAI 兼容接口实时合成的本人声音。","response_format":"mp3"}' \\
   --output speech.mp3`;
 
+    const mcpEnv = { VOXPOLY_API_URL: origin };
+    if (needAuth) mcpEnv.VOXPOLY_ACCESS_TOKEN = "<YOUR_ACCESS_TOKEN>";
     $("snippetMcp").textContent = JSON.stringify(
       {
         mcpServers: {
           voxpoly: {
             command: "python",
             args: ["-m", "backend.mcp_server"],
-            env: { VOXPOLY_API_URL: origin },
+            env: mcpEnv,
           },
         },
       },
@@ -2155,11 +2160,45 @@ docker compose up -d`;
     $("settingsModal").addEventListener("click", (e) => { if (e.target === $("settingsModal")) $("settingsModal").hidden = true; });
     $("btnSaveSettings").addEventListener("click", saveSettings);
 
-    $("btnSubmitToken").addEventListener("click", async () => {
-      state.accessToken = $("accessTokenInput").value.trim();
-      localStorage.setItem("voxpoly_access_token", state.accessToken);
-      $("tokenModal").hidden = true;
-      await bootData();
+    async function submitAccessToken() {
+      const entered = $("accessTokenInput").value.trim();
+      const errEl = $("tokenErrorMsg");
+      if (!entered) {
+        errEl.textContent = "请输入访问口令。";
+        errEl.hidden = false;
+        return;
+      }
+      errEl.hidden = true;
+      $("btnSubmitToken").disabled = true;
+      try {
+        const resp = await fetch("/api/auth/session", {
+          method: "POST",
+          credentials: "same-origin",
+          headers: { "Content-Type": "application/json", "X-VoxPoly-Request": "1" },
+          body: JSON.stringify({ token: entered }),
+        });
+        const data = await resp.json().catch(() => null);
+        if (!resp.ok) {
+          errEl.textContent = data?.detail || "访问口令不正确，请重试。";
+          errEl.hidden = false;
+          return;
+        }
+        $("accessTokenInput").value = "";
+        state.authRequired = false;
+        $("tokenModal").hidden = true;
+        await bootData();
+        showToast("口令验证通过", "teal");
+      } catch (err) {
+        errEl.textContent = `连接失败：${err.message}`;
+        errEl.hidden = false;
+      } finally {
+        $("btnSubmitToken").disabled = false;
+      }
+    }
+
+    $("btnSubmitToken").addEventListener("click", submitAccessToken);
+    $("accessTokenInput").addEventListener("keydown", (e) => {
+      if (e.key === "Enter") submitAccessToken();
     });
 
     window.addEventListener("resize", () => {
@@ -2171,19 +2210,27 @@ docker compose up -d`;
   }
 
   async function bootData() {
-    await loadSystemStatus(true);
-    await Promise.all([loadVoices(), loadJobs(), loadPodcasts(), loadVideos(), loadGlossary()]);
-    if (!$("podScriptInput").value.trim()) {
-      $("podScriptInput").value = DEMO_PODCAST_SCRIPT;
+    try {
+      await loadSystemStatus(true);
+      if (state.authRequired) return;
+      await Promise.all([loadVoices(), loadJobs(), loadPodcasts(), loadVideos(), loadGlossary()]);
+      if (!$("podScriptInput").value.trim()) {
+        $("podScriptInput").value = DEMO_PODCAST_SCRIPT;
+      }
+      renderPodcastSpeakersUI();
+    } catch (err) {
+      if (!state.authRequired) showToast(err.message, "error");
     }
-    renderPodcastSpeakersUI();
   }
 
   async function boot() {
+    try { localStorage.removeItem("voxpoly_access_token"); } catch {}
     initEvents();
     drawIdleMicMeter();
     await bootData();
-    state.statusTimer = setInterval(() => loadSystemStatus(false), 8000);
+    state.statusTimer = setInterval(() => {
+      if (!state.authRequired) loadSystemStatus(false);
+    }, 8000);
   }
 
   boot();

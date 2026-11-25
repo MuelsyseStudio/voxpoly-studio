@@ -14,7 +14,8 @@ import numpy as np
 import soundfile as sf
 
 from backend.audio_utils import _run_ffmpeg, get_ffmpeg_path, load_wav_float32, save_generated_audio
-from backend.config import BASE_DIR, LIPSYNC_BACKEND, LIPSYNC_PYTHON, LIPSYNC_REPO_DIR, QWEN_SAMPLE_RATE
+from backend.config import BASE_DIR, LIPSYNC_BACKEND, LIPSYNC_PYTHON, LIPSYNC_REPO_DIR, MAX_VIDEO_MB, QWEN_SAMPLE_RATE
+from backend.net_safety import validate_public_http_url
 
 SUBTITLE_STYLES: List[Dict[str, str]] = [
     {
@@ -59,50 +60,49 @@ def has_lipsync() -> bool:
 
 
 def download_video_from_url(url: str, out_dir: Path) -> Tuple[Path, str]:
-    """Download video from YouTube / Bilibili / X / TikTok via yt-dlp into clean MP4."""
-    clean_url = url.strip()
-    if not clean_url.startswith(("http://", "https://")):
-        raise ValueError("请输入以 http:// 或 https:// 开头的有效视频链接。")
+    """Download video from YouTube / Bilibili / X / TikTok via isolated socket-guarded yt-dlp runner."""
+    clean_url = validate_public_http_url(url)
+    if importlib.util.find_spec("yt_dlp") is None:
+        raise RuntimeError("未安装 yt-dlp Python 包，请运行 pip install yt-dlp 后重试链接导入。")
+
     out_dir.mkdir(parents=True, exist_ok=True)
-    out_tmpl = str(out_dir / "source.%(ext)s")
-
-    if importlib.util.find_spec("yt_dlp") is not None:
-        import yt_dlp
-
-        ydl_opts = {
-            "format": "bv*[height<=1080][ext=mp4]+ba[ext=m4a]/b[height<=1080][ext=mp4]/b",
-            "merge_output_format": "mp4",
-            "outtmpl": out_tmpl,
-            "noplaylist": True,
-            "quiet": True,
-            "no_warnings": True,
-            "max_filesize": 300 * 1024 * 1024,
-        }
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(clean_url, download=True)
-            title = str(info.get("title") or "在线视频")[:48]
-    elif shutil.which("yt-dlp"):
-        cmd = [
-            "yt-dlp",
-            "--no-playlist",
-            "-f",
-            "bv*[height<=1080][ext=mp4]+ba[ext=m4a]/b[height<=1080][ext=mp4]/b",
-            "--merge-output-format",
-            "mp4",
-            "-o",
-            out_tmpl,
-            clean_url,
-        ]
-        proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=240)
-        if proc.returncode != 0:
-            raise RuntimeError(f"yt-dlp 下载失败: {(proc.stderr or proc.stdout)[-400:]}")
-        title = "在线视频"
-    else:
-        raise RuntimeError("未安装 yt-dlp，请运行 pip install yt-dlp 后重试链接导入。")
+    max_bytes = MAX_VIDEO_MB * 1024 * 1024
+    env = os.environ.copy()
+    for k in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "all_proxy", "no_proxy"):
+        env.pop(k, None)
+    env["PYTHONUTF8"] = "1"
+    env["PYTHONIOENCODING"] = "utf-8"
+    env["PYTHONPATH"] = str(BASE_DIR) + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
+    proc = subprocess.run(
+        [sys.executable, "-m", "backend.safe_ytdlp", clean_url, str(out_dir), str(MAX_VIDEO_MB)],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        env=env,
+        cwd=str(BASE_DIR),
+        timeout=240,
+    )
+    payload = None
+    for line in reversed((proc.stdout or "").splitlines()):
+        s = line.strip()
+        if s.startswith("{") and s.endswith("}"):
+            try:
+                payload = json.loads(s)
+                break
+            except Exception:
+                pass
+    if proc.returncode != 0 or not payload or not payload.get("ok"):
+        err = (payload.get("error") if isinstance(payload, dict) else None) or (proc.stderr or proc.stdout)[-400:]
+        raise RuntimeError(f"视频下载失败: {err}")
+    title = str(payload.get("title") or "在线视频")[:48]
 
     cand = next((p for p in out_dir.glob("source.*") if p.suffix.lower() in (".mp4", ".mkv", ".webm", ".mov")), None)
     if not cand:
         raise RuntimeError("视频下载完成但未找到有效视频文件。")
+    if cand.stat().st_size > max_bytes:
+        cand.unlink(missing_ok=True)
+        raise ValueError(f"下载视频体积超过 {MAX_VIDEO_MB} MB 上限，已中止处理。")
     if cand.suffix.lower() != ".mp4":
         mp4_path = out_dir / "source.mp4"
         _run_ffmpeg(["-i", str(cand), "-c:v", "copy", "-c:a", "aac", str(mp4_path)])
@@ -112,7 +112,18 @@ def download_video_from_url(url: str, out_dir: Path) -> Tuple[Path, str]:
 
 
 def probe_video(video_path: Path) -> Dict[str, Any]:
-    cmd = [get_ffprobe_path(), "-v", "error", "-print_format", "json", "-show_format", "-show_streams", str(video_path)]
+    cmd = [
+        get_ffprobe_path(),
+        "-protocol_whitelist",
+        "file,pipe",
+        "-v",
+        "error",
+        "-print_format",
+        "json",
+        "-show_format",
+        "-show_streams",
+        str(video_path),
+    ]
     proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
     if proc.returncode != 0:
         raise RuntimeError(f"视频信息读取失败: {proc.stderr.strip()}")

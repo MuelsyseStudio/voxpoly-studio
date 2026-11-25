@@ -1,14 +1,22 @@
 from __future__ import annotations
 
+import hashlib
+import hmac
+import os
+import posixpath
+import re
+import secrets
 import shutil
 import tempfile
 import threading
 import time
 import urllib.request
 import uuid
+from collections import deque
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Deque, Dict, List, Optional, Tuple
+from urllib.parse import urlparse
 
 import numpy as np
 import soundfile as sf
@@ -17,6 +25,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
+from starlette._utils import get_route_path
 
 from backend.asr_service import asr_service
 from backend.audio_utils import (
@@ -48,6 +57,7 @@ from backend.config import (
 from backend.document_parser import parse_document_bytes, parse_url_article
 from backend.glossary import apply_tts_pronunciation, glossary_store
 from backend.mastering import MASTERING_PRESETS, apply_mastering_dsp
+from backend.net_safety import validate_public_http_url
 from backend.podcast_engine import (
     assemble_podcast_audio,
     generate_two_host_podcast_script,
@@ -204,34 +214,290 @@ async def lifespan(app: FastAPI):
     stop_ev.set()
 
 
-app = FastAPI(title="VoxPoly Studio V3 Pro", version="3.0.0", lifespan=lifespan)
+app = FastAPI(title="VoxPoly Studio V3 Pro", version="3.0.1", lifespan=lifespan)
 
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+_PUBLIC_READ_EXACT = {"/", "/favicon.ico", "/api/health"}
+_SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
+_SESSION_COOKIE_NAME = "voxpoly_session"
+_SESSION_TTL_SEC = 24 * 3600
+_MAX_SESSIONS = 256
+_AUTH_FAIL_WINDOW_SEC = 60.0
+_AUTH_FAIL_MAX = 15
+_MAX_RATE_LIMIT_KEYS = 2048
+
+_MEDIA_BUCKETS: Dict[str, Path] = {
+    "voices": VOICES_DIR,
+    "outputs": OUTPUTS_DIR,
+    "podcasts": PODCASTS_DIR,
+    "videos": VIDEOS_DIR,
+}
+_ALLOWED_MEDIA_SERVE_EXTS = {
+    ".wav",
+    ".mp3",
+    ".mp4",
+    ".mov",
+    ".mkv",
+    ".webm",
+    ".m4a",
+    ".ogg",
+    ".flac",
+    ".aac",
+    ".opus",
+    ".srt",
+    ".ass",
+}
+
+
+class _AuthState:
+    """In-memory revocable session store + sliding-window failed-auth rate limiter."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._sessions: Dict[str, Tuple[str, float]] = {}  # sid -> (token_sha256, exp_mono)
+        self._fail_hits: Dict[str, Deque[float]] = {}
+
+    @staticmethod
+    def _token_digest(token: str) -> str:
+        return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+    def create_session(self, expected_token: str) -> str:
+        sid = secrets.token_urlsafe(32)
+        now = time.monotonic()
+        digest = self._token_digest(expected_token)
+        with self._lock:
+            expired = [k for k, (_, exp) in self._sessions.items() if exp <= now]
+            for k in expired:
+                self._sessions.pop(k, None)
+            while len(self._sessions) >= _MAX_SESSIONS:
+                oldest = next(iter(self._sessions))
+                self._sessions.pop(oldest, None)
+            self._sessions[sid] = (digest, now + _SESSION_TTL_SEC)
+        return sid
+
+    def validate_session(self, sid: str, expected_token: str) -> bool:
+        if not sid or not expected_token:
+            return False
+        now = time.monotonic()
+        expected_digest = self._token_digest(expected_token)
+        with self._lock:
+            entry = self._sessions.get(sid)
+            if not entry:
+                return False
+            stored_digest, exp = entry
+            if exp <= now or not hmac.compare_digest(stored_digest, expected_digest):
+                self._sessions.pop(sid, None)
+                return False
+            return True
+
+    def revoke_session(self, sid: str) -> None:
+        if not sid:
+            return
+        with self._lock:
+            self._sessions.pop(sid, None)
+
+    def is_rate_limited(self, client_key: str) -> bool:
+        now = time.monotonic()
+        cutoff = now - _AUTH_FAIL_WINDOW_SEC
+        with self._lock:
+            dq = self._fail_hits.get(client_key)
+            if not dq:
+                return False
+            while dq and dq[0] <= cutoff:
+                dq.popleft()
+            if not dq:
+                self._fail_hits.pop(client_key, None)
+                return False
+            return len(dq) >= _AUTH_FAIL_MAX
+
+    def record_failure(self, client_key: str) -> None:
+        now = time.monotonic()
+        cutoff = now - _AUTH_FAIL_WINDOW_SEC
+        with self._lock:
+            if client_key not in self._fail_hits and len(self._fail_hits) >= _MAX_RATE_LIMIT_KEYS:
+                # Prune stale buckets first, then evict oldest if still at cap
+                stale = [k for k, q in self._fail_hits.items() if not q or q[-1] <= cutoff]
+                for k in stale:
+                    self._fail_hits.pop(k, None)
+                while len(self._fail_hits) >= _MAX_RATE_LIMIT_KEYS:
+                    self._fail_hits.pop(next(iter(self._fail_hits)), None)
+            dq = self._fail_hits.setdefault(client_key, deque())
+            while dq and dq[0] <= cutoff:
+                dq.popleft()
+            dq.append(now)
+
+    def clear_failures(self, client_key: str) -> None:
+        with self._lock:
+            self._fail_hits.pop(client_key, None)
+
+    def reset_all(self) -> None:
+        with self._lock:
+            self._sessions.clear()
+            self._fail_hits.clear()
+
+
+_auth_state = _AuthState()
+
+
+def _active_access_token() -> str:
+    return os.getenv("VOXPOLY_ACCESS_TOKEN", ACCESS_TOKEN).strip()
+
+
+def _normalize_route_path(scope: Dict[str, Any]) -> str:
+    """Use the exact same ASGI route path (scope['path'] minus root_path) that Starlette routes on."""
+    raw = get_route_path(scope) or "/"
+    collapsed = re.sub(r"/+", "/", raw)
+    cleaned = posixpath.normpath(collapsed)
+    return "/" + cleaned.lstrip("/")
+
+
+def _peer_host(request: Request) -> str:
+    """Return raw TCP peer IP (preserved intact when Uvicorn runs with --no-proxy-headers)."""
+    return request.client.host if request.client and request.client.host else "unknown"
+
+
+def _client_key(request: Request) -> str:
+    peer = _peer_host(request)
+    # When explicitly deployed behind local Cloudflare Tunnel proxy, separate rate-limit buckets by real client IP
+    if peer in ("127.0.0.1", "::1", "localhost") and os.getenv("VOXPOLY_TRUST_CF_IP", "").strip() == "1":
+        cf_ip = (request.headers.get("cf-connecting-ip") or "").strip()
+        if cf_ip:
+            return cf_ip[:64]
+    return peer
+
+
+def _is_https_request(request: Request) -> bool:
+    if request.scope.get("scheme") == "https":
+        return True
+    # Trust X-Forwarded-Proto strictly when the raw TCP peer is local loopback (e.g. cloudflared on 127.0.0.1)
+    if _peer_host(request) in ("127.0.0.1", "::1", "localhost"):
+        proto = (request.headers.get("x-forwarded-proto") or "").split(",")[0].strip().lower()
+        return proto == "https"
+    return False
+
+
+def _extract_header_token(request: Request) -> str:
+    auth_h = request.headers.get("authorization", "")
+    bearer = auth_h[7:].strip() if auth_h.lower().startswith("bearer ") else ""
+    return (request.headers.get("x-access-token") or bearer or "").strip()
+
+
+def _tokens_match(supplied: str, expected: str) -> bool:
+    if not supplied or not expected:
+        return False
+    return hmac.compare_digest(supplied.encode("utf-8"), expected.encode("utf-8"))
+
+
+def _passes_same_origin_check(request: Request, require_custom_header: bool) -> bool:
+    sec_fetch = (request.headers.get("sec-fetch-site") or "").strip().lower()
+    if sec_fetch and sec_fetch not in ("same-origin", "none"):
+        return False
+    origin = (request.headers.get("origin") or "").strip()
+    if origin:
+        host = (request.headers.get("host") or "").strip().lower()
+        origin_netloc = urlparse(origin).netloc.lower()
+        if not host or origin_netloc != host:
+            return False
+    if require_custom_header and request.headers.get("x-voxpoly-request") != "1":
+        return False
+    return True
 
 
 @app.middleware("http")
-async def optional_access_token_guard(request: Request, call_next):
-    if ACCESS_TOKEN and (request.url.path.startswith("/api/") or request.url.path.startswith("/v1/")) and request.url.path != "/api/health":
-        auth_h = request.headers.get("authorization", "")
-        bearer = auth_h[7:].strip() if auth_h.lower().startswith("bearer ") else ""
-        supplied = (
-            request.headers.get("x-access-token")
-            or bearer
-            or request.query_params.get("token")
-            or request.cookies.get("voxpoly_token")
-            or ""
-        ).strip()
-        if supplied != ACCESS_TOKEN:
-            return JSONResponse(status_code=401, content={"detail": "访问受口令保护，请输入正确的访问口令。"})
-    return await call_next(request)
+async def security_and_access_token_guard(request: Request, call_next):
+    norm_path = _normalize_route_path(request.scope)
+    method = request.method.upper()
+    expected = _active_access_token()
+    is_public = False
+
+    if expected:
+        is_public = (
+            (norm_path in _PUBLIC_READ_EXACT and method in ("GET", "HEAD"))
+            or (norm_path.startswith("/static/") and method in ("GET", "HEAD"))
+            or (norm_path == "/api/auth/session" and method in ("POST", "DELETE"))
+        )
+
+        if not is_public:
+            cookie_sid = (request.cookies.get(_SESSION_COOKIE_NAME) or "").strip()
+            authed_via_cookie = _auth_state.validate_session(cookie_sid, expected)
+            authed_via_header = False
+
+            if not authed_via_cookie:
+                ckey = f"hdr:{_client_key(request)}"
+                if _auth_state.is_rate_limited(ckey):
+                    return JSONResponse(
+                        status_code=429,
+                        content={"detail": "认证失败次数过多，请 60 秒后重试。"},
+                        headers={"Cache-Control": "private, no-store", "Retry-After": "60"},
+                    )
+                header_tok = _extract_header_token(request)
+                authed_via_header = _tokens_match(header_tok, expected)
+                if authed_via_header:
+                    _auth_state.clear_failures(ckey)
+                else:
+                    _auth_state.record_failure(ckey)
+                    return JSONResponse(
+                        status_code=401,
+                        content={"detail": "访问受口令保护，请输入正确的访问口令。"},
+                        headers={"Cache-Control": "private, no-store"},
+                    )
+
+            # Enforce same-origin + custom header CSRF protection on cookie-authenticated mutations
+            if authed_via_cookie and method not in _SAFE_METHODS:
+                if not _passes_same_origin_check(request, require_custom_header=True):
+                    return JSONResponse(
+                        status_code=403,
+                        content={"detail": "跨源写请求已被 CSRF 防护策略拒绝。"},
+                        headers={"Cache-Control": "private, no-store"},
+                    )
+
+    response = await call_next(request)
+    if norm_path == "/api/auth/session" or (expected and not is_public):
+        response.headers["Cache-Control"] = "private, no-store"
+    return response
+
+
+_EXTRA_CORS_ORIGINS = [
+    o.strip() for o in os.getenv("VOXPOLY_CORS_ORIGINS", "").split(",") if o.strip()
+]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_EXTRA_CORS_ORIGINS,
+    allow_origin_regex=r"^https?://(127\.0\.0\.1|localhost)(:\d+)?$",
+    allow_credentials=False,
+    allow_methods=["GET", "HEAD", "POST", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Content-Type", "Authorization", "X-Access-Token", "X-VoxPoly-Request"],
+)
 
 
 FRONTEND_DIR.mkdir(parents=True, exist_ok=True)
-app.mount("/media/voices", StaticFiles(directory=str(VOICES_DIR)), name="media_voices")
-app.mount("/media/outputs", StaticFiles(directory=str(OUTPUTS_DIR)), name="media_outputs")
-app.mount("/media/podcasts", StaticFiles(directory=str(PODCASTS_DIR)), name="media_podcasts")
-app.mount("/media/videos", StaticFiles(directory=str(VIDEOS_DIR)), name="media_videos")
 app.mount("/static", StaticFiles(directory=str(FRONTEND_DIR)), name="static_frontend")
+
+
+@app.api_route("/media/{bucket}/{file_path:path}", methods=["GET", "HEAD"], include_in_schema=False)
+def serve_media_allowlisted(bucket: str, file_path: str):
+    """Serve strictly allowlisted audio/video/subtitle files after canonical filesystem resolution."""
+    base_dir = _MEDIA_BUCKETS.get(bucket)
+    if base_dir is None or not file_path or "\\" in file_path or "\x00" in file_path:
+        raise HTTPException(status_code=404, detail="Not found")
+
+    segments = file_path.split("/")
+    for seg in segments:
+        if not seg or seg in (".", "..") or seg.startswith(".") or seg.endswith((".", " ", "\t")):
+            raise HTTPException(status_code=404, detail="Not found")
+
+    root = base_dir.resolve()
+    try:
+        target = (root / Path(*segments)).resolve(strict=True)
+    except (FileNotFoundError, OSError, RuntimeError):
+        raise HTTPException(status_code=404, detail="Not found")
+
+    if not target.is_relative_to(root) or not target.is_file():
+        raise HTTPException(status_code=404, detail="Not found")
+    # Enforce extension allowlist on the canonical resolved filename (closes Windows trailing-dot/space & 8.3 aliases)
+    if target.name.startswith(".") or target.suffix.lower() not in _ALLOWED_MEDIA_SERVE_EXTS:
+        raise HTTPException(status_code=404, detail="Not found")
+
+    return FileResponse(str(target))
 
 
 # ---------- Schemas ----------
@@ -908,6 +1174,10 @@ def _analyze_video_file(src_path: Path, video_id: str, title: str, orig_filename
     return record
 
 
+class AuthSessionRequest(BaseModel):
+    token: str = Field(default="", max_length=4096)
+
+
 # ---------- Core System Routes ----------
 @app.get("/")
 def serve_index():
@@ -919,7 +1189,74 @@ def serve_index():
 
 @app.get("/api/health")
 def health():
-    return {"ok": True, "service": "voxpoly-studio-v3", "version": "3.0.0", "requires_token": bool(ACCESS_TOKEN)}
+    expected = _active_access_token()
+    return {
+        "ok": True,
+        "service": "voxpoly-studio-v3",
+        "version": "3.0.1",
+        "requires_token": bool(expected),
+        "token_strong": len(expected) >= 12,
+        "media_protected": bool(expected),
+    }
+
+
+@app.post("/api/auth/session")
+def create_auth_session(request: Request, payload: AuthSessionRequest):
+    if not _passes_same_origin_check(request, require_custom_header=False):
+        return JSONResponse(
+            status_code=403,
+            content={"detail": "跨源登录请求已被拒绝。"},
+            headers={"Cache-Control": "private, no-store"},
+        )
+    expected = _active_access_token()
+    if not expected:
+        return JSONResponse(
+            {"authenticated": True, "requires_token": False},
+            headers={"Cache-Control": "private, no-store"},
+        )
+    ckey = f"sess:{_client_key(request)}"
+    if _auth_state.is_rate_limited(ckey):
+        return JSONResponse(
+            status_code=429,
+            content={"detail": "认证失败次数过多，请 60 秒后重试。"},
+            headers={"Cache-Control": "private, no-store", "Retry-After": "60"},
+        )
+    supplied = (payload.token or _extract_header_token(request)).strip()
+    if not _tokens_match(supplied, expected):
+        _auth_state.record_failure(ckey)
+        return JSONResponse(
+            status_code=401,
+            content={"detail": "访问口令不正确，请重试。"},
+            headers={"Cache-Control": "private, no-store"},
+        )
+    _auth_state.clear_failures(ckey)
+    sid = _auth_state.create_session(expected)
+    resp = JSONResponse({"authenticated": True, "requires_token": True}, headers={"Cache-Control": "private, no-store"})
+    resp.set_cookie(
+        key=_SESSION_COOKIE_NAME,
+        value=sid,
+        httponly=True,
+        samesite="lax",
+        secure=_is_https_request(request),
+        max_age=_SESSION_TTL_SEC,
+        path="/",
+    )
+    return resp
+
+
+@app.delete("/api/auth/session")
+def clear_auth_session(request: Request):
+    if _active_access_token() and not _passes_same_origin_check(request, require_custom_header=True):
+        return JSONResponse(
+            status_code=403,
+            content={"detail": "跨源登出请求已被拒绝。"},
+            headers={"Cache-Control": "private, no-store"},
+        )
+    sid = (request.cookies.get(_SESSION_COOKIE_NAME) or "").strip()
+    _auth_state.revoke_session(sid)
+    resp = JSONResponse({"authenticated": False}, headers={"Cache-Control": "private, no-store"})
+    resp.delete_cookie(key=_SESSION_COOKIE_NAME, path="/")
+    return resp
 
 
 @app.get("/api/system/status")
@@ -931,7 +1268,7 @@ def system_status():
             "demucs_available": has_demucs(),
             "yt_dlp_available": has_yt_dlp(),
             "lipsync_available": has_lipsync(),
-            "access_token_enabled": bool(ACCESS_TOKEN),
+            "access_token_enabled": bool(_active_access_token()),
             "qwen_batch_size": QWEN_BATCH_SIZE,
             "watermark_supported": True,
             "openai_compat_url": "/v1/audio/speech",
@@ -971,6 +1308,18 @@ def get_settings():
 
 @app.post("/api/settings")
 def update_settings(payload: SettingsPatch):
+    if payload.llm_api_base is not None:
+        base_clean = payload.llm_api_base.strip()
+        if base_clean:
+            parsed = urlparse(base_clean)
+            if parsed.scheme.lower() not in ("http", "https") or not parsed.hostname:
+                raise HTTPException(status_code=400, detail="llm_api_base 必须是有效的 http:// 或 https:// 地址。")
+            # In token-protected (remote/public) deployments, block private/metadata LLM endpoints unless admin opts in
+            if _active_access_token() and os.getenv("VOXPOLY_ALLOW_LOCAL_LLM", "").strip() != "1":
+                try:
+                    validate_public_http_url(base_clean)
+                except ValueError as exc:
+                    raise HTTPException(status_code=400, detail=f"公网模式下拒绝内网 LLM 地址: {exc}") from exc
     updated = store.update_settings(payload.model_dump(exclude_none=True))
     if payload.qwen_variant:
         engine_manager.qwen3.set_variant(payload.qwen_variant)

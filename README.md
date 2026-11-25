@@ -163,7 +163,7 @@ chmod +x install_linux_mac.sh start_linux_mac.sh
 
 1. 点击 [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/zianxu78-ux/voxpoly-studio/blob/main/colab/VoxPoly_Colab.ipynb) 在你的 Google 账号中打开 [colab/VoxPoly_Colab.ipynb](./colab/VoxPoly_Colab.ipynb)（完全运行在你自己的 Colab 实例与 Google Drive 中）；
 2. 选择 **`L4` / `A100`**（或 `T4`）GPU 运行时，依次运行 4 个 Cell；
-3. 自动生成 Colab 官方免密 HTTPS 预览链接与 Cloudflare 公网链接（附带 `/v1` OpenAI TTS 入口）。
+3. **默认仅开放 Colab 官方 Google 账号私密 HTTPS 入口（公网隧道默认关闭）**；若需手动开启 Cloudflare 公网链接供外部调用 `/v1/audio/speech`，必须先在 Step 3 填写 `ACCESS_TOKEN`（全站保护 `/api/*`、`/v1/*` 与 `/media/*` 音视频文件）。
 
 ---
 

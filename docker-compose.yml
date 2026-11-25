@@ -4,7 +4,9 @@ services:
     container_name: voxpoly-studio
     restart: unless-stopped
     ports:
-      - "8765:8765"
+      # Bound strictly to host loopback by default.
+      # If you change this to expose externally, ALWAYS set a strong VOXPOLY_ACCESS_TOKEN (>= 12 chars).
+      - "127.0.0.1:8765:8765"
     volumes:
       - ./data:/app/data
     environment:
@@ -13,8 +15,8 @@ services:
       - VOXPOLY_QWEN_VARIANT=1.7b
       - VOXPOLY_WHISPER_MODEL=small
       - VOXPOLY_QWEN_BATCH_SIZE=3
-      # Optional passcode lock when exposing outside localhost:
-      - VOXPOLY_ACCESS_TOKEN=
+      # Passcode lock protecting /api/*, /v1/*, and /media/* (required if exposing beyond 127.0.0.1):
+      - VOXPOLY_ACCESS_TOKEN=${VOXPOLY_ACCESS_TOKEN:-}
     deploy:
       resources:
         reservations:

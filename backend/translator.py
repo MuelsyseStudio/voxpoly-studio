@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 import json
+import os
 import re
+import urllib.parse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 
-from backend.config import LANGUAGE_BY_CODE
+from backend.config import ACCESS_TOKEN, LANGUAGE_BY_CODE
 from backend.glossary import protect_terms_for_translation, restore_terms_after_translation
+from backend.net_safety import post_public_json
 
 
 def detect_script_language(text: str) -> Optional[str]:
@@ -62,7 +65,10 @@ def _clean_translated_text(text: str) -> str:
 
 
 def _call_llm_json(api_base: str, api_key: str, model: str, system_prompt: str, user_prompt: str) -> Any:
-    endpoint = api_base.rstrip("/")
+    endpoint = api_base.strip().rstrip("/")
+    parsed = urllib.parse.urlparse(endpoint)
+    if parsed.scheme.lower() not in ("http", "https") or not parsed.hostname:
+        raise ValueError("LLM API Base URL 必须为有效的 http:// 或 https:// 地址。")
     if not endpoint.endswith("/chat/completions"):
         endpoint = f"{endpoint}/chat/completions"
 
@@ -75,10 +81,16 @@ def _call_llm_json(api_base: str, api_key: str, model: str, system_prompt: str, 
             {"role": "user", "content": user_prompt},
         ],
     }
-    with httpx.Client(timeout=60.0) as client:
-        resp = client.post(endpoint, headers=headers, json=payload)
-        resp.raise_for_status()
-        data = resp.json()
+    token_active = bool(os.getenv("VOXPOLY_ACCESS_TOKEN", ACCESS_TOKEN).strip())
+    allow_local = os.getenv("VOXPOLY_ALLOW_LOCAL_LLM", "").strip() == "1"
+    if token_active and not allow_local:
+        # Connection-pinned public-IP POST (closes pre-saved private URLs and DNS rebinding)
+        data = post_public_json(endpoint, headers=headers, payload=payload, total_timeout_sec=60.0)
+    else:
+        with httpx.Client(timeout=60.0, follow_redirects=False) as client:
+            resp = client.post(endpoint, headers=headers, json=payload)
+            resp.raise_for_status()
+            data = resp.json()
 
     content = data["choices"][0]["message"]["content"].strip()
     fence_match = re.search(r"```(?:json)?\s*([\{\[].*?[\}\]])\s*```", content, re.S)

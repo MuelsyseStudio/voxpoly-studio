@@ -9,7 +9,10 @@ import zipfile
 from pathlib import Path
 from typing import Any, Dict, List
 
-import httpx
+from backend.net_safety import fetch_public_url_bytes
+
+MAX_URL_HTML_BYTES = 5 * 1024 * 1024
+MAX_REDIRECTS = 5
 
 
 def _strip_html(raw_html: str) -> str:
@@ -199,13 +202,13 @@ def parse_document_bytes(raw: bytes, filename: str) -> Dict[str, Any]:
 
 
 def parse_url_article(url: str) -> Dict[str, Any]:
-    clean_url = url.strip()
-    if not re.match(r"^https?://", clean_url, re.I):
-        raise ValueError("请输入以 http:// 或 https:// 开头的有效网页链接。")
-    with httpx.Client(timeout=20.0, follow_redirects=True) as client:
-        resp = client.get(clean_url, headers={"User-Agent": "Mozilla/5.0 (compatible; VoxPolyStudio/3.0)"})
-        resp.raise_for_status()
-        raw_html = resp.text
+    clean_url, raw_bytes, encoding = fetch_public_url_bytes(
+        url,
+        max_bytes=MAX_URL_HTML_BYTES,
+        max_redirects=MAX_REDIRECTS,
+        total_timeout_sec=20.0,
+    )
+    raw_html = raw_bytes.decode(encoding or "utf-8", errors="ignore")
 
     title = "网页文章"
     m_title = re.search(r"<title[^>]*>(.*?)</title>", raw_html, re.I | re.S)

@@ -84,8 +84,12 @@ class StudioStore:
             cur = self.get_settings(masked=False)
             if "translation_provider" in patch and patch["translation_provider"] in ("auto", "free", "llm"):
                 cur["translation_provider"] = patch["translation_provider"]
+            old_api_base = str(cur.get("llm_api_base") or "").strip()
+            base_changed = False
             if "llm_api_base" in patch:
-                cur["llm_api_base"] = str(patch["llm_api_base"] or "").strip()
+                new_base = str(patch["llm_api_base"] or "").strip()
+                base_changed = bool(new_base != old_api_base)
+                cur["llm_api_base"] = new_base
             if "llm_model" in patch:
                 cur["llm_model"] = str(patch["llm_model"] or "").strip() or "deepseek-chat"
             if "enable_watermark" in patch:
@@ -98,12 +102,15 @@ class StudioStore:
                 cur["mastering_preset"] = patch["mastering_preset"]
             if "idle_unload_minutes" in patch:
                 cur["idle_unload_minutes"] = max(0, min(120, int(patch["idle_unload_minutes"])))
-            if "llm_api_key" in patch:
-                val = str(patch["llm_api_key"] or "").strip()
-                if patch.get("clear_api_key"):
-                    cur["llm_api_key"] = ""
-                elif val and "••••" not in val:
-                    cur["llm_api_key"] = val
+
+            supplied_key = str(patch.get("llm_api_key") or "").strip() if "llm_api_key" in patch else ""
+            if patch.get("clear_api_key"):
+                cur["llm_api_key"] = ""
+            elif supplied_key and "••••" not in supplied_key:
+                cur["llm_api_key"] = supplied_key
+            elif base_changed:
+                # Never forward an old saved API key to a newly changed llm_api_base host
+                cur["llm_api_key"] = ""
             self._write_json(SETTINGS_FILE, cur)
             return self.get_settings(masked=True)
 
@@ -261,6 +268,7 @@ class StudioStore:
                     (f"dub_{code}.mp3", f"{code}/dubbed_{code}.mp3"),
                     (f"sub_{code}.srt", f"{code}/subtitle_{code}.srt"),
                     (f"sub_{code}_bilingual.srt", f"{code}/subtitle_{code}_bilingual.srt"),
+                    (f"sub_{code}.ass", f"{code}/subtitle_{code}.ass"),
                 ):
                     p = vdir / fname
                     if p.exists():
