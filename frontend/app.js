@@ -15,6 +15,29 @@
     "[嘉宾]: 更棒的是，加上 OpenAI 兼容接口和 MCP 协议，连你的笔记软件和 AI 助手也能直接用你的声音朗读！",
   ].join("\n");
 
+  const WORKSPACES = {
+    audio: {
+      title: "多语种语音合成",
+      description: "用一段参考录音，把台词或长文合成为多语种音轨。",
+      action: "编辑台词",
+    },
+    podcast: {
+      title: "播客与有声书",
+      description: "导入文章或电子书，为不同角色分配声音，再合成音频。",
+      action: "导入文稿",
+    },
+    video: {
+      title: "多语种视频译配",
+      description: "导入视频、校对译文并为说话人分配声纹，导出成片与字幕。",
+      action: "导入视频",
+    },
+    tools: {
+      title: "词典、水印与 API",
+      description: "配置全局术语和读音，查验水印，或通过 API 和命令行调用工作台。",
+      action: "编辑词典",
+    },
+  };
+
   const state = {
     authRequired: false,
     workspaceTab: "audio",
@@ -128,7 +151,11 @@
     try { data = await resp.json(); } catch { data = null; }
     if (resp.status === 401) {
       state.authRequired = true;
-      $("tokenModal").hidden = false;
+      if ($("tokenModal").hidden) {
+        $("settingsModal").hidden = true;
+        $("tokenModal").hidden = false;
+        $("accessTokenInput").focus();
+      }
       throw new Error(data?.detail || "需要访问口令");
     }
     if (!resp.ok) throw new Error(data?.detail || data?.message || `请求失败 (${resp.status})`);
@@ -150,8 +177,16 @@
   function switchWorkspaceTab(tabName) {
     state.workspaceTab = tabName;
     document.querySelectorAll("[data-workspace-tab]").forEach((b) => {
-      b.classList.toggle("active", b.dataset.workspaceTab === tabName);
+      const active = b.dataset.workspaceTab === tabName;
+      b.classList.toggle("active", active);
+      if (active) b.setAttribute("aria-current", "page");
+      else b.removeAttribute("aria-current");
     });
+    const workspace = WORKSPACES[tabName];
+    $("workspaceIntro").dataset.workspace = tabName;
+    $("workspaceTitle").textContent = workspace.title;
+    $("workspaceDescription").textContent = workspace.description;
+    $("workspacePrimaryLink").textContent = workspace.action;
     $("workspaceAudio").hidden = tabName !== "audio";
     $("workspacePodcast").hidden = tabName !== "podcast";
     $("workspaceVideo").hidden = tabName !== "video";
@@ -195,7 +230,7 @@
   state.streamAudio.addEventListener("ended", playNextStreamChunk);
 
   // ---------- Canvas Waveform ----------
-  function drawWaveform(canvas, peaks, progress = 0, accentColor = "#0D6E6E") {
+  function drawWaveform(canvas, peaks, progress = 0) {
     if (!canvas) return;
     const ctx = canvas.getContext("2d");
     const dpr = window.devicePixelRatio || 1;
@@ -223,14 +258,14 @@
     for (let i = 0; i < count; i++) {
       const val = Math.max(0.06, Math.min(1, Number(sampled[i]) || 0.1));
       const h = Math.max(3, val * (cssH - 8));
-      ctx.fillStyle = i / count <= progress ? accentColor : "#CBD5E1";
+      ctx.fillStyle = i / count <= progress ? "#6a4a8b" : "#bdb0cd";
       ctx.beginPath();
       ctx.roundRect(i * (barW + gap), midY - h / 2, barW, h, 1.5);
       ctx.fill();
     }
     if (progress > 0 && progress < 1) {
       const px = progress * cssW;
-      ctx.strokeStyle = "#D92D20";
+      ctx.strokeStyle = "#a95243";
       ctx.lineWidth = 1.5;
       ctx.beginPath();
       ctx.moveTo(px, 2);
@@ -421,7 +456,9 @@
 
   function syncEngineUI() {
     document.querySelectorAll("[data-select-engine]").forEach((el) => {
-      el.classList.toggle("active", el.dataset.selectEngine === state.selectedEngineId);
+      const active = el.dataset.selectEngine === state.selectedEngineId;
+      el.classList.toggle("active", active);
+      el.setAttribute("aria-pressed", String(active));
     });
     const isQwen = state.selectedEngineId === "qwen3";
     const isCb = state.selectedEngineId === "chatterbox";
@@ -484,21 +521,21 @@
         const badge = v.is_demo ? "示范" : `${v.quality_score ?? "—"}分`;
         const delBtn = v.is_demo ? "" : `<button type="button" class="btn-del-mini" data-del-voice="${escapeHtml(v.id)}">删除</button>`;
         return `
-          <div class="voice-item ${active}" data-select-voice="${escapeHtml(v.id)}">
-            <div class="voice-item-info">
-              <div class="voice-item-name">${escapeHtml(v.name)}</div>
-              <div class="voice-item-meta">${v.duration_sec}s · ${Math.round((v.sample_rate || 24000) / 1000)}kHz · ${badge}</div>
-            </div>
+          <div class="voice-item ${active}">
+            <button type="button" class="voice-item-info" data-select-voice="${escapeHtml(v.id)}" aria-pressed="${Boolean(active)}">
+              <span class="voice-item-name">${escapeHtml(v.name)}</span>
+              <span class="voice-item-meta">${v.duration_sec}s · ${Math.round((v.sample_rate || 24000) / 1000)}kHz · ${badge}</span>
+            </button>
             ${delBtn}
           </div>
         `;
       })
       .join("");
     list.querySelectorAll("[data-select-voice]").forEach((el) => {
-      el.addEventListener("click", (e) => {
-        if (e.target.closest("[data-del-voice]")) return;
+      el.addEventListener("click", () => {
         state.selectedVoiceId = el.dataset.selectVoice;
         renderVoiceList();
+        list.querySelector(`[data-select-voice="${CSS.escape(state.selectedVoiceId)}"]`)?.focus();
         renderActiveVoiceInspector();
       });
     });
@@ -518,6 +555,7 @@
 
   function renderActiveVoiceInspector() {
     const voice = state.voices.find((v) => v.id === state.selectedVoiceId);
+    $("workspaceVoiceLink").textContent = voice ? `声纹 · ${voice.name}` : "选择声纹";
     const box = $("voiceInspector");
     if (!voice) { box.hidden = true; return; }
     box.hidden = false;
@@ -585,7 +623,7 @@
     if (!canvas) return;
     const ctx = canvas.getContext("2d");
     ctx.clearRect(0, 0, canvas.width, canvas.height);
-    ctx.strokeStyle = "#DCE1E8";
+    ctx.strokeStyle = "#776885";
     ctx.lineWidth = 1.5;
     ctx.beginPath();
     ctx.moveTo(12, canvas.height / 2);
@@ -643,7 +681,7 @@
         for (let i = 0; i < bars; i++) {
           const val = buf[i * step] / 255;
           const h = Math.max(4, val * (canvas.height - 14));
-          ctx.fillStyle = val > 0.85 ? "#D92D20" : "#0D6E6E";
+          ctx.fillStyle = val > 0.85 ? "#f5a59a" : "#c9afe5";
           ctx.beginPath();
           ctx.roundRect(10 + i * (bw + 3), (canvas.height - h) / 2, bw, h, 2);
           ctx.fill();
@@ -700,7 +738,7 @@
       .map((lang) => {
         const selected = state.selectedLangs.has(lang.code) ? "selected" : "";
         return `
-          <button type="button" class="lang-chip ${selected}" data-lang="${escapeHtml(lang.code)}">
+          <button type="button" class="lang-chip ${selected}" data-lang="${escapeHtml(lang.code)}" aria-pressed="${Boolean(selected)}">
             <span class="lang-code-tag">${escapeHtml(lang.region_tag)}</span>
             <span class="lang-chip-labels">
               <span class="lang-zh">${escapeHtml(lang.label_zh)}</span>
@@ -720,6 +758,7 @@
           state.selectedLangs.add(code);
         }
         renderLangGrid();
+        grid.querySelector(`[data-lang="${CSS.escape(code)}"]`)?.focus();
         renderPerLangScripts();
         updateGenerateButtonLabel();
       });
@@ -728,11 +767,12 @@
   }
 
   function updateGenerateButtonLabel() {
-    $("btnGenerateLabel").textContent = `一键生成 ${state.selectedLangs.size} 国语音`;
+    $("btnGenerateLabel").textContent = `生成 ${state.selectedLangs.size} 种语音`;
   }
 
   function renderPerLangScripts() {
     const container = $("perLangScripts");
+    $("btnToggleScripts").setAttribute("aria-expanded", String(!state.scriptsCollapsed));
     if (state.scriptsCollapsed) {
       container.hidden = true;
       $("btnToggleScripts").textContent = "展开编辑区";
@@ -748,7 +788,7 @@
             <span>${escapeHtml(l.label_zh)} · ${escapeHtml(l.native_name)}</span>
             <span>${escapeHtml(l.region_tag)}</span>
           </div>
-          <textarea class="field-textarea compact" rows="3" data-lang-script="${escapeHtml(l.code)}" placeholder="点击「一键翻译所选语种」自动生成，或直接手动输入">${escapeHtml(state.scripts[l.code] || "")}</textarea>
+          <textarea class="field-textarea compact" rows="3" data-lang-script="${escapeHtml(l.code)}" aria-label="${escapeHtml(l.label_zh)}译文" placeholder="点击「翻译台词」生成译文，或直接输入">${escapeHtml(state.scripts[l.code] || "")}</textarea>
         </div>
       `)
       .join("");
@@ -795,7 +835,7 @@
   }
 
   async function startMultilingualGeneration() {
-    if (!state.selectedVoiceId) { showToast("请先在左侧选择或上传参考人声", "error"); return; }
+    if (!state.selectedVoiceId) { showToast("请先在声纹库选择或上传参考录音", "error"); return; }
     const selSt = state.enginesStatus[state.selectedEngineId];
     if (selSt && !selSt.installed) { showToast(`${selSt.display_name} 尚未安装，请在安装脚本或 Colab Cell 2 勾选启用`, "error"); return; }
 
@@ -961,8 +1001,8 @@
             <div class="track-footer">
               <div class="track-metrics">
                 <span class="tele-chip">时长 ${t.duration_sec}s</span>
-                <span class="tele-chip">耗时 ${t.elapsed_sec}s</span>
-                <span class="tele-chip">RTF ${t.rtf}×</span>
+                ${Number.isFinite(t.elapsed_sec) ? `<span class="tele-chip">耗时 ${t.elapsed_sec}s</span>` : ""}
+                ${Number.isFinite(t.rtf) ? `<span class="tele-chip">RTF ${t.rtf}×</span>` : ""}
                 ${chunkChip}${mastChip}${wmChip}
               </div>
               <div class="track-dl-group">
@@ -1066,21 +1106,21 @@
         const created = (j.created_at || "").replace("T", " ").slice(0, 16);
         const tag = j.engine_id === "chatterbox" ? "CB23" : j.engine_id === "cosyvoice3" ? "CV3" : "QW10";
         return `
-          <div class="history-item ${active}" data-open-job="${escapeHtml(j.id)}">
-            <div class="history-main">
-              <div class="history-title">[${tag}] ${escapeHtml(j.voice_name)} · ${escapeHtml(langs)}</div>
-              <div class="history-sub">${created} · ${j.completed_count}/${j.total_count} 完成</div>
-            </div>
+          <div class="history-item ${active}">
+            <button type="button" class="history-main" data-open-job="${escapeHtml(j.id)}" aria-pressed="${Boolean(active)}">
+              <span class="history-title">[${tag}] ${escapeHtml(j.voice_name)} · ${escapeHtml(langs)}</span>
+              <span class="history-sub">${created} · ${j.completed_count}/${j.total_count} 完成</span>
+            </button>
             <button type="button" class="btn-del-mini" data-del-job="${escapeHtml(j.id)}">删除</button>
           </div>
         `;
       })
       .join("");
     list.querySelectorAll("[data-open-job]").forEach((el) => {
-      el.addEventListener("click", (e) => {
-        if (e.target.closest("[data-del-job]")) return;
+      el.addEventListener("click", () => {
         state.activeJobId = el.dataset.openJob;
         renderHistory();
+        list.querySelector(`[data-open-job="${CSS.escape(state.activeJobId)}"]`)?.focus();
         renderJob(state.jobs.find((j) => j.id === state.activeJobId));
       });
     });
@@ -1135,11 +1175,11 @@
           ? state.voices
               .map((v) => `<option value="${escapeHtml(v.id)}" ${v.id === curVid ? "selected" : ""}>${escapeHtml(v.name)}</option>`)
               .join("")
-          : `<option value="">请先在左侧上传声纹</option>`;
+          : `<option value="">请先向声纹库上传录音</option>`;
         return `
           <div class="speaker-assign-item">
             <span class="speaker-tag">${escapeHtml(spk)}</span>
-            <select class="field-input" data-pod-spk="${escapeHtml(spk)}">${opts}</select>
+            <select class="field-input" data-pod-spk="${escapeHtml(spk)}" aria-label="${escapeHtml(spk)}的声纹">${opts}</select>
           </div>
         `;
       })
@@ -1282,7 +1322,7 @@
   async function startPodcastGeneration() {
     const scriptText = $("podScriptInput").value.trim();
     if (!scriptText) { showToast("请先输入多角色对话剧本", "error"); return; }
-    if (!state.voices.length) { showToast("声纹库为空，请先在左侧上传参考录音", "error"); return; }
+    if (!state.voices.length) { showToast("声纹库为空，请先上传参考录音", "error"); return; }
     const st = $("podGenStatus");
     st.hidden = false;
     st.className = "inline-status compact-inline";
@@ -1370,7 +1410,7 @@
               <div class="track-footer">
                 <div class="track-metrics">
                   <span class="tele-chip">时长 ${t.duration_sec}s</span>
-                  <span class="tele-chip">耗时 ${t.elapsed_sec}s</span>
+                  ${Number.isFinite(t.elapsed_sec) ? `<span class="tele-chip">耗时 ${t.elapsed_sec}s</span>` : ""}
                   <span class="tele-chip teal">${escapeHtml(mastTxt)}</span>
                   ${pod.add_ambient_bgm ? `<span class="tele-chip teal">氛围 BGM</span>` : ""}
                   ${t.watermarked ? `<span class="tele-chip teal">隐形水印</span>` : ""}
@@ -1416,20 +1456,20 @@
     if (!state.podcasts.length) { list.innerHTML = `<div class="empty-hint">暂无历史播客</div>`; return; }
     list.innerHTML = state.podcasts
       .map((p) => `
-        <div class="history-item ${p.id === state.activePodcastId ? "active" : ""}" data-open-pod="${escapeHtml(p.id)}">
-          <div class="history-main">
-            <div class="history-title">${escapeHtml(p.title)}</div>
-            <div class="history-sub">${(p.speakers || []).join(" & ")} · ${(p.tracks || []).filter((t) => t.status === "completed").length}/${(p.tracks || []).length} 语种完成</div>
-          </div>
+        <div class="history-item ${p.id === state.activePodcastId ? "active" : ""}">
+          <button type="button" class="history-main" data-open-pod="${escapeHtml(p.id)}" aria-pressed="${p.id === state.activePodcastId}">
+            <span class="history-title">${escapeHtml(p.title)}</span>
+            <span class="history-sub">${escapeHtml((p.speakers || []).join(" & "))} · ${(p.tracks || []).filter((t) => t.status === "completed").length}/${(p.tracks || []).length} 语种完成</span>
+          </button>
           <button type="button" class="btn-del-mini" data-del-pod="${escapeHtml(p.id)}">删除</button>
         </div>
       `)
       .join("");
     list.querySelectorAll("[data-open-pod]").forEach((el) => {
-      el.addEventListener("click", (e) => {
-        if (e.target.closest("[data-del-pod]")) return;
+      el.addEventListener("click", () => {
         state.activePodcastId = el.dataset.openPod;
         renderPodcastHistory();
+        list.querySelector(`[data-open-pod="${CSS.escape(state.activePodcastId)}"]`)?.focus();
         renderActivePodcast(state.podcasts.find((p) => p.id === state.activePodcastId));
       });
     });
@@ -1572,7 +1612,7 @@
           return `
             <div class="speaker-assign-item">
               <span class="speaker-tag">${escapeHtml(sp.speaker)}</span>
-              <select class="field-input" data-vid-spk="${escapeHtml(sp.speaker)}">${opts}</select>
+              <select class="field-input" data-vid-spk="${escapeHtml(sp.speaker)}" aria-label="${escapeHtml(sp.speaker)}的声纹">${opts}</select>
             </div>
           `;
         })
@@ -1638,7 +1678,10 @@
                     <span class="track-title">${escapeHtml(o.lang_label)} 译配成片</span>
                     ${lsBadge}
                   </div>
-                  <span class="count-mono">${o.mp4_size_mb} MB · 耗时 ${o.elapsed_sec}s</span>
+                  <span class="count-mono">${[
+                    Number.isFinite(o.mp4_size_mb) && `${o.mp4_size_mb} MB`,
+                    Number.isFinite(o.elapsed_sec) && `耗时 ${o.elapsed_sec}s`,
+                  ].filter(Boolean).join(" · ")}</span>
                 </div>
                 <video controls playsinline src="${escapeHtml(o.mp4_url)}?v=${encodeURIComponent(video.updated_at || "1")}"></video>
                 <div class="track-dl-group">
@@ -1665,21 +1708,21 @@
     if (!state.videos.length) { list.innerHTML = `<div class="empty-hint">暂无视频译配记录</div>`; return; }
     list.innerHTML = state.videos
       .map((v) => `
-        <div class="history-item ${v.id === state.activeVideoId ? "active" : ""}" data-open-video="${escapeHtml(v.id)}">
-          <div class="history-main">
-            <div class="history-title">${escapeHtml(v.title)} (${v.duration_sec}s)</div>
-            <div class="history-sub">${v.segments.length} 句 · ${(v.speakers || []).length || 1} 人 · ${(v.outputs || []).filter((o) => o.status === "completed").length} 语种成片</div>
-          </div>
+        <div class="history-item ${v.id === state.activeVideoId ? "active" : ""}">
+          <button type="button" class="history-main" data-open-video="${escapeHtml(v.id)}" aria-pressed="${v.id === state.activeVideoId}">
+            <span class="history-title">${escapeHtml(v.title)} (${v.duration_sec}s)</span>
+            <span class="history-sub">${v.segments.length} 句 · ${(v.speakers || []).length || 1} 人 · ${(v.outputs || []).filter((o) => o.status === "completed").length} 语种成片</span>
+          </button>
           <button type="button" class="btn-del-mini" data-del-video="${escapeHtml(v.id)}">删除</button>
         </div>
       `)
       .join("");
     list.querySelectorAll("[data-open-video]").forEach((el) => {
-      el.addEventListener("click", (e) => {
-        if (e.target.closest("[data-del-video]")) return;
+      el.addEventListener("click", () => {
         state.activeVideoId = el.dataset.openVideo;
         state.videoSpeakerVoices = {};
         renderVideoHistory();
+        list.querySelector(`[data-open-video="${CSS.escape(state.activeVideoId)}"]`)?.focus();
         renderActiveVideo();
       });
     });
@@ -1940,6 +1983,11 @@ docker compose up -d`;
     $("setEnableWatermark").checked = s.enable_watermark !== false;
   }
 
+  function closeSettings() {
+    $("settingsModal").hidden = true;
+    $("btnOpenSettings").focus();
+  }
+
   async function saveSettings() {
     try {
       const updated = await apiFetch("/api/settings", {
@@ -1960,7 +2008,7 @@ docker compose up -d`;
       fillSettingsModal(updated);
       $("audioMasteringSelect").value = updated.mastering_preset || "raw";
       await loadSystemStatus(false);
-      $("settingsModal").hidden = true;
+      if (!state.authRequired) closeSettings();
       showToast("设置已保存", "teal");
     } catch (err) {
       showToast(err.message, "error");
@@ -1970,7 +2018,19 @@ docker compose up -d`;
   // ---------- Event Wiring ----------
   function initEvents() {
     document.querySelectorAll("[data-workspace-tab]").forEach((btn) => {
-      btn.addEventListener("click", () => switchWorkspaceTab(btn.dataset.workspaceTab));
+      btn.addEventListener("click", () => {
+        if (state.workspaceTab === btn.dataset.workspaceTab) return;
+        switchWorkspaceTab(btn.dataset.workspaceTab);
+        window.scrollTo({ top: 0 });
+      });
+    });
+
+    document.querySelectorAll(".dropzone[role=button]").forEach((zone) => {
+      zone.addEventListener("keydown", (event) => {
+        if (event.key !== " " && event.key !== "Enter") return;
+        event.preventDefault();
+        zone.click();
+      });
     });
 
     document.querySelectorAll("[data-capture-tab]").forEach((btn) => {
@@ -1978,7 +2038,7 @@ docker compose up -d`;
         const tab = btn.dataset.captureTab;
         document.querySelectorAll("[data-capture-tab]").forEach((b) => {
           b.classList.toggle("active", b === btn);
-          b.setAttribute("aria-selected", String(b === btn));
+          b.setAttribute("aria-pressed", String(b === btn));
         });
         $("paneUpload").hidden = tab !== "upload";
         $("paneRecord").hidden = tab !== "record";
@@ -2047,7 +2107,7 @@ docker compose up -d`;
       state.sourceDirty = true;
       $("translateStatus").hidden = false;
       $("translateStatus").className = "inline-status warn";
-      $("translateStatus").textContent = "原句已修改：可点击「一键翻译」预览译文，或直接点击生成自动翻译并合成。";
+      $("translateStatus").textContent = "台词已修改。可先翻译并预览译文，也可直接生成语音。";
       renderPresets();
     });
     $("btnSelectTop4").addEventListener("click", () => { state.selectedLangs = new Set(["zh", "en", "ja", "fr"]); renderLangGrid(); renderPerLangScripts(); });
@@ -2154,11 +2214,36 @@ docker compose up -d`;
     });
 
     // Modals
-    $("btnOpenSettings").addEventListener("click", async () => { try { fillSettingsModal(await apiFetch("/api/settings")); } catch {} $("settingsModal").hidden = false; });
-    $("btnCloseSettings").addEventListener("click", () => ($("settingsModal").hidden = true));
-    $("btnCancelSettings").addEventListener("click", () => ($("settingsModal").hidden = true));
-    $("settingsModal").addEventListener("click", (e) => { if (e.target === $("settingsModal")) $("settingsModal").hidden = true; });
+    $("btnOpenSettings").addEventListener("click", async () => {
+      try {
+        fillSettingsModal(await apiFetch("/api/settings"));
+        $("settingsModal").hidden = false;
+        $("btnCloseSettings").focus();
+      } catch (err) {
+        if (!state.authRequired) showToast(err.message, "error");
+      }
+    });
+    $("btnCloseSettings").addEventListener("click", closeSettings);
+    $("btnCancelSettings").addEventListener("click", closeSettings);
+    $("settingsModal").addEventListener("click", (e) => { if (e.target === $("settingsModal")) closeSettings(); });
     $("btnSaveSettings").addEventListener("click", saveSettings);
+    document.addEventListener("keydown", (e) => {
+      const tokenModal = $("tokenModal");
+      const settingsModal = $("settingsModal");
+      const modal = tokenModal.hidden ? settingsModal : tokenModal;
+      if (modal.hidden) return;
+      if (e.key === "Escape" && modal === settingsModal) {
+        closeSettings();
+      } else if (e.key === "Tab") {
+        const controls = [...modal.querySelectorAll("button:not(:disabled), input:not(:disabled), select:not(:disabled)")];
+        const index = controls.indexOf(document.activeElement);
+        if (index < 0 || (e.shiftKey ? index === 0 : index === controls.length - 1)) {
+          e.preventDefault();
+          const target = e.shiftKey ? controls.at(-1) : controls[0];
+          target?.focus();
+        }
+      }
+    });
 
     async function submitAccessToken() {
       const entered = $("accessTokenInput").value.trim();
@@ -2186,6 +2271,7 @@ docker compose up -d`;
         $("accessTokenInput").value = "";
         state.authRequired = false;
         $("tokenModal").hidden = true;
+        $("workspaceTitle").focus();
         await bootData();
         showToast("口令验证通过", "teal");
       } catch (err) {
